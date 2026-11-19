@@ -16,11 +16,14 @@ public class MoonBridge {
     public static final int VIDEO_FORMAT_H265_MAIN10 = 0x0200;
     public static final int VIDEO_FORMAT_AV1_MAIN8 = 0x1000;
     public static final int VIDEO_FORMAT_AV1_MAIN10 = 0x2000;
+    public static final int VIDEO_FORMAT_PYROWAVE = 0x10000;
+    public static final int VIDEO_FORMAT_PYROWAVE_10BIT = 0x20000;
 
     public static final int VIDEO_FORMAT_MASK_H264 = 0x000F;
     public static final int VIDEO_FORMAT_MASK_H265 = 0x0F00;
     public static final int VIDEO_FORMAT_MASK_AV1 = 0xF000;
-    public static final int VIDEO_FORMAT_MASK_10BIT = 0x2200;
+    public static final int VIDEO_FORMAT_MASK_PYROWAVE = 0xF0000;
+    public static final int VIDEO_FORMAT_MASK_10BIT = 0xAAA00;
 
     public static final int BUFFER_TYPE_PICDATA = 0;
     public static final int BUFFER_TYPE_SPS = 1;
@@ -219,10 +222,11 @@ public class MoonBridge {
 
     public static int bridgeDrSubmitDecodeUnit(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
                                                int frameNumber, int frameType, char frameHostProcessingLatency,
-                                               long receiveTimeUs, long enqueueTimeUs) {
+                                               long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
         if (videoRenderer != null) {
             return videoRenderer.submitDecodeUnit(decodeUnitData, decodeUnitLength,
-                    decodeUnitType, frameNumber, frameType, frameHostProcessingLatency, receiveTimeUs, enqueueTimeUs);
+                    decodeUnitType, frameNumber, frameType, frameHostProcessingLatency,
+                    receiveTimeUs, enqueueTimeUs, presentationTimeUs);
         }
         else {
             return DR_OK;
@@ -411,6 +415,8 @@ public class MoonBridge {
     public static native long getEstimatedRttInfo();
 
     public static native String getLaunchUrlQueryParameters();
+
+    public static native String getHostPyroWaveBitstreamId();
 
     public static native byte guessControllerType(int vendorId, int productId);
 

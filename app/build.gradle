@@ -4,6 +4,9 @@ android {
     ndkVersion "29.0.14206865"
 
     compileSdk 37
+    // The composed SDK ships build-tools 37. AGP 9 otherwise asks for 36
+    // and tries to install it into ANDROID_HOME.
+    buildToolsVersion "37.0.0"
 
     namespace 'com.limelight'
 
@@ -130,6 +133,14 @@ android {
     externalNativeBuild {
         ndkBuild {
             path "src/main/jni/Android.mk"
+        }
+    }
+
+    sourceSets {
+        main {
+            // The prebuilt is dlopen'd. Linking it would drop the NEEDED entry,
+            // so package the ABI directory directly.
+            jniLibs.srcDirs = ['src/main/jni/pyrowave/lib']
         }
     }
 

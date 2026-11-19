@@ -393,8 +393,12 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 glPrefs.glRenderer,
                 this);
 
+        boolean usePyrowave = prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE &&
+                decoderRenderer.isPyrowaveSupported();
+
         // Don't stream HDR if the decoder can't support it
-        if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported() && !decoderRenderer.isAv1Main10Supported()) {
+        if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported() && !decoderRenderer.isAv1Main10Supported() &&
+                !usePyrowave) {
             willStreamHdr = false;
             Toast.makeText(this, "Decoder does not support HDR10 profile", Toast.LENGTH_LONG).show();
         }
@@ -421,6 +425,12 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_AV1_MAIN8;
             if (willStreamHdr && decoderRenderer.isAv1Main10Supported()) {
                 supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_AV1_MAIN10;
+            }
+        }
+        if (usePyrowave) {
+            supportedVideoFormats = MoonBridge.VIDEO_FORMAT_PYROWAVE;
+            if (willStreamHdr) {
+                supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_PYROWAVE_10BIT;
             }
         }
 
@@ -517,6 +527,17 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             // Start the USB driver
             bindService(new Intent(this, UsbDriverService.class),
                     usbDriverServiceConnection, Service.BIND_AUTO_CREATE);
+        }
+
+        if (prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE && !usePyrowave) {
+            if (spinner != null) {
+                spinner.dismiss();
+                spinner = null;
+            }
+
+            Dialog.displayDialog(this, getResources().getString(R.string.conn_error_title),
+                    "This device can't decode PyroWave. It needs Vulkan 1.1 with subgroup size control on a 64-bit ARM device.", true);
+            return;
         }
 
         if (!decoderRenderer.isAvcSupported()) {
@@ -1110,7 +1131,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 if (message != null) {
                     message += " [";
 
-                    if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
+                    if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_PYROWAVE) != 0) {
+                        message += "PyroWave";
+                    }
+                    else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
                         message += "H.264";
                     }
                     else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0) {
