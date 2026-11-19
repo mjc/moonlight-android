@@ -1846,7 +1846,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Enable direct submit on supported hardware. A PyroWave decode can stall
         // the receive thread, so leave that path on the queued submit.
-        if (directSubmit && prefs.videoFormat != PreferenceConfiguration.FormatOption.FORCE_PYROWAVE) {
+        if (directSubmit
+                && prefs.videoFormat != PreferenceConfiguration.FormatOption.FORCE_PYROWAVE
+                && prefs.videoFormat != PreferenceConfiguration.FormatOption.PREFER_PYROWAVE) {
             capabilities |= MoonBridge.CAPABILITY_DIRECT_SUBMIT;
         }
 

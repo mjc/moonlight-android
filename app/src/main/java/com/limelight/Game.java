@@ -393,12 +393,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 glPrefs.glRenderer,
                 this);
 
-        boolean usePyrowave = prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE &&
-                decoderRenderer.isPyrowaveSupported();
+        boolean preferPyrowave = prefConfig.videoFormat == PreferenceConfiguration.FormatOption.PREFER_PYROWAVE;
+        boolean forcePyrowave = prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE;
+        boolean pyrowaveSupported = (preferPyrowave || forcePyrowave) && decoderRenderer.isPyrowaveSupported();
 
         // Don't stream HDR if the decoder can't support it
         if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported() && !decoderRenderer.isAv1Main10Supported() &&
-                !usePyrowave) {
+                !pyrowaveSupported) {
             willStreamHdr = false;
             Toast.makeText(this, "Decoder does not support HDR10 profile", Toast.LENGTH_LONG).show();
         }
@@ -427,10 +428,17 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_AV1_MAIN10;
             }
         }
-        if (usePyrowave) {
-            supportedVideoFormats = MoonBridge.VIDEO_FORMAT_PYROWAVE;
+        if (pyrowaveSupported) {
+            int pyrowaveFormats = MoonBridge.VIDEO_FORMAT_PYROWAVE;
             if (willStreamHdr) {
-                supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_PYROWAVE_10BIT;
+                pyrowaveFormats |= MoonBridge.VIDEO_FORMAT_PYROWAVE_10BIT;
+            }
+            // PyroWave only offers that codec. Prefer adds it in front of the others.
+            if (forcePyrowave) {
+                supportedVideoFormats = pyrowaveFormats;
+            }
+            else {
+                supportedVideoFormats |= pyrowaveFormats;
             }
         }
 
@@ -529,7 +537,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     usbDriverServiceConnection, Service.BIND_AUTO_CREATE);
         }
 
-        if (prefConfig.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE && !usePyrowave) {
+        if (forcePyrowave && !pyrowaveSupported) {
             if (spinner != null) {
                 spinner.dismiss();
                 spinner = null;

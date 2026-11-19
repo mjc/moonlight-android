@@ -15,6 +15,7 @@ public class PreferenceConfiguration {
         FORCE_AV1,
         FORCE_HEVC,
         FORCE_H264,
+        PREFER_PYROWAVE,
         FORCE_PYROWAVE,
     };
 
@@ -362,6 +363,9 @@ public class PreferenceConfiguration {
         }
         else if (str.equals("neverh265")) {
             return FormatOption.FORCE_H264;
+        }
+        else if (str.equals("preferpyrowave")) {
+            return FormatOption.PREFER_PYROWAVE;
         }
         else if (str.equals("pyrowave")) {
             return FormatOption.FORCE_PYROWAVE;
