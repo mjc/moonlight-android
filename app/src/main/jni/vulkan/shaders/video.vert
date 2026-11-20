@@ -4,7 +4,7 @@
 layout(push_constant) uniform PushConstants {
     vec4 uvRect;   // xy = UV of the crop's top-left corner, zw = UV size of the crop
     vec4 uvClamp;  // xy = min UV, zw = max UV (half a texel inside the crop)
-    vec4 params;   // x = dither amplitude, y = frame counter, z = output mode, w = tone-map white ratio
+    vec4 params;   // x = dither amplitude, y = dither offset, z = output mode, w = tone-map white ratio
     vec4 params2;  // x = PQ-to-SDR scale, y = quarter turns, z/w = planar green coefficients
     vec4 ycbcr;    // Used by the planar fragment shader
 } pc;

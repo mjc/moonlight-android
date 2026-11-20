@@ -5,7 +5,7 @@
 layout(push_constant) uniform PushConstants {
     vec4 uvRect;
     vec4 uvClamp;
-    vec4 params;   // x = dither amplitude, y = frame counter, z = output mode, w = tone-map white ratio
+    vec4 params;   // x = dither amplitude, y = dither offset, z = output mode, w = tone-map white ratio
     vec4 params2;  // x = PQ-to-SDR scale, y = quarter turns, z/w = planar green Cb/Cr coefficients
     vec4 ycbcr;    // Planar video: x/y = red Cr and blue Cb scales, z = chroma midpoint, w = chroma U offset
 } pc;
@@ -57,7 +57,7 @@ vec4 outputColor(vec3 color) {
     if (amplitude > 0.0) {
         // Triangular dither of +/- 1 LSB from two decorrelated noise samples, moved each
         // frame so the pattern averages out over time instead of sitting still.
-        vec2 p = gl_FragCoord.xy + 5.588238 * pc.params.y;
+        vec2 p = gl_FragCoord.xy + pc.params.y;
         float n = ign(p) + ign(p + vec2(47.0, 17.0)) - 1.0;
         color += n * amplitude;
     }

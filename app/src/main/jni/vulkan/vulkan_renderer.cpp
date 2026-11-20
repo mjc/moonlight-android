@@ -2236,7 +2236,7 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
         contentPeakNits = hdrMetadata_.contentPeakNits;
     }
     pc.params[0] = ditherAmplitude;
-    pc.params[1] = static_cast<float>(frameCounter_ % 64);
+    pc.params[1] = 5.588238f * static_cast<float>(frameCounter_ % 64);
     pc.params[2] = (hdrActive_ && !outputPq_) ? kOutputPqToSdr : kOutputPassthrough;
     pc.params[3] = std::max(contentPeakNits / kSdrWhiteNits, 1.0f);
     pc.params2[0] = kPqToSdrScale;
