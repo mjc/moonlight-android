@@ -33,6 +33,24 @@ struct PyrowaveBytes {
     const PyrowaveSpan* spans = nullptr;
     size_t spanCount = 0;
 
+    // Spans are ordered and non-overlapping. Start at the last span whose offset is at or
+    // before the requested byte, rather than rescanning packet spans from the beginning for
+    // every record in a frame.
+    size_t firstSpanCandidate(size_t offset) const {
+        size_t low = 0;
+        size_t high = spanCount;
+        while (low < high) {
+            const size_t mid = low + (high - low) / 2;
+            if (spans[mid].offset <= offset) {
+                low = mid + 1;
+            }
+            else {
+                high = mid;
+            }
+        }
+        return low == 0 ? 0 : low - 1;
+    }
+
     // True when [offset, length) sits in the contiguous buffer or in one span, so a push can
     // hand that pointer over. A contiguous frame is one span: its runs stay coalesced.
     bool oneSpan(size_t offset, size_t length) const {
@@ -46,7 +64,7 @@ struct PyrowaveBytes {
         if (end < offset) {
             return false;
         }
-        for (size_t i = 0; i < spanCount; i++) {
+        for (size_t i = firstSpanCandidate(offset); i < spanCount; i++) {
             const PyrowaveSpan& span = spans[i];
             const size_t spanEnd = span.offset + span.length;
             if (span.length == 0 || span.data == nullptr || spanEnd < span.offset) {
@@ -79,7 +97,7 @@ struct PyrowaveBytes {
             return nullptr;
         }
         size_t filled = 0;
-        for (size_t i = 0; i < spanCount; i++) {
+        for (size_t i = firstSpanCandidate(offset); i < spanCount; i++) {
             const PyrowaveSpan& span = spans[i];
             if (span.length == 0 || span.data == nullptr) {
                 return nullptr;
