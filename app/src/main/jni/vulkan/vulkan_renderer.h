@@ -455,6 +455,9 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffers_[kFramesInFlight] {};
     VkFence fences_[kFramesInFlight] {};
+    // Generation of the shared-queue draw submitted into each slot, 0 when none is watched.
+    uint64_t slotBlitGen_[kFramesInFlight] {};
+    uint64_t nextBlitGen_ = 0;
     VkSemaphore imageAcquired_[kFramesInFlight] {};
     FramePtr slotFrames_[kFramesInFlight];
     uint64_t frameCounter_ = 0;
@@ -638,8 +641,10 @@ private:
                        int64_t commonToLocalNs, int64_t hostProcessingNs);
     void countLatency(LatencySpan& span, int64_t latencyNs, bool synced);
     // Pause keep-busy around a decode submit. beforeDecodeSubmit runs after the shared-queue
-    // blit wait and before vkQueueSubmit. finishOutstandingDecode runs once that submit's fence
-    // wait has returned, or the submit failed, or the frame was not queued.
+    // blit wait and before vkQueueSubmit, and it returns only once the chunks already on the
+    // GPU have finished. finishOutstandingDecode runs once that submit's fence wait has
+    // returned, or the submit failed, or the frame was not queued. New chunks then wait until
+    // the draw's fence has signaled.
     void beforeDecodeSubmit();
     void finishOutstandingDecode();
     static void beforeDecodeSubmitThunk(void* userdata);
@@ -648,8 +653,11 @@ private:
     std::map<int64_t, FrameOrigin> origins_;
     CaptureLatency captureLatency_;
 
-    // The PyroWave waiting thread's: when the last decode it timed ended on the GPU
+    // The PyroWave waiting thread's: when the last decode it timed ended on the GPU,
+    // and how long that decode occupied the GPU. The next shared-queue frame's pacer
+    // arrival adds the duration: the decode just submitted is still running.
     int64_t lastDecodeGpuEndNs_ = 0;
+    int64_t lastDecodeGpuNs_ = 0;
 
     // Whether trace_ is recording, read without mutex_. Writes are still made under it.
     std::atomic<bool> traceRecording_ {false};

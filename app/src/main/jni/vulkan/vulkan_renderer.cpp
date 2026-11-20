@@ -1014,11 +1014,12 @@ void VulkanRenderer::pyrowaveWaiterMain() {
         }
 
         // The draw is queued before the fence wait, so the next decode can follow it on this queue.
-        // The pacer's arrival is that handoff. Decode latency and the partial-frame deadline use
-        // the time the fence actually returns.
+        // The pacer's arrival includes the previous decode's GPU time. This one was just
+        // submitted and is not ready to show. Decode latency and the partial-frame deadline
+        // use the time the fence actually returns.
         const bool shareQueue = pyrowaveSharesQueue_;
         if (shareQueue) {
-            frame->timing.arrivalNs = nowNs();
+            frame->timing.arrivalNs = nowNs() + lastDecodeGpuNs_;
             noteDecoded(*frame, frame->timing.arrivalNs, false);
             FramePtr held = frame;
             enqueueFrame(std::move(frame), false);
@@ -1050,6 +1051,9 @@ void VulkanRenderer::pyrowaveWaiterMain() {
         if (!pyrowave_->gpuTimes(frame->readyValue, &gpuStartNs, &gpuEndNs) || gpuEndNs < gpuStartNs) {
             gpuStartNs = 0;
             gpuEndNs = 0;
+        }
+        else if (gpuEndNs - gpuStartNs < 100'000'000) {
+            lastDecodeGpuNs_ = gpuEndNs - gpuStartNs;
         }
         const int64_t cpuNs = frame->decodeQueuedNs - frame->decodeStartNs - frame->decodeTimes.waitedNs;
         if (gpuEndNs != 0) {
@@ -1985,6 +1989,11 @@ void VulkanRenderer::presentAhead() {
                 return;
             }
             showVsyncNs = pacer_.plannedVsyncNs(pending_.front()->timing);
+            if (showVsyncNs == 0 && pending_.front()->sharedBlit) {
+                // The next decode cannot be submitted until this draw is queued. Commit the
+                // frame at its assigned vsync even when that is outside the present-ahead window.
+                showVsyncNs = pacer_.assignedVsyncNs(pending_.front()->timing);
+            }
             if (showVsyncNs == 0) {
                 return;
             }
@@ -2085,6 +2094,11 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     }
 
     const int slot = static_cast<int>(frameCounter_ % kFramesInFlight);
+    if (slotBlitGen_[slot] != 0) {
+        // Before this fence is reset. A keep-busy wait on it has to finish first.
+        keepBusy_.retireBlit(slotBlitGen_[slot]);
+        slotBlitGen_[slot] = 0;
+    }
     // The fence is nearly always done by now, so ask before waiting on it
     VkResult result = vk_.vkGetFenceStatus ? vk_.vkGetFenceStatus(device_, fences_[slot]) : VK_NOT_READY;
     const bool fenceWaited = result != VK_SUCCESS;
@@ -2370,6 +2384,12 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
             pyrowave_->revertBlitSemaphore(frame->blitPhase);
         }
         return false;
+    }
+    if (frame->sharedBlit && keepBusyGroups_ != 0) {
+        const uint64_t generation = ++nextBlitGen_;
+        if (keepBusy_.armBlitGate(vk_.vkWaitForFences, device_, fences_[slot], generation)) {
+            slotBlitGen_[slot] = generation;
+        }
     }
     if (frontBufferAligned_ && frontBuffer_) {
         drawSubmitNs_.push_back(nowNs() - startNs);

@@ -40,9 +40,14 @@ public:
                const char* globalPriorityExt, int64_t chunkNs, uint32_t groups);
     // Waits for the work in flight, then frees everything. Safe to call more than once.
     void stop();
-    // No new chunks until resume(). One already submitted still finishes.
+    // Finishes every chunk already submitted. Submits nothing until resume().
     void pause();
     void resume();
+    // Chunks started after resume wait until this fence signals. The fence belongs to
+    // another device. retireBlit must run before that fence is reset, and it waits out
+    // a wait already inside vkWaitForFences. generation is the submit's id.
+    bool armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation);
+    void retireBlit(uint64_t generation);
 
 private:
     static constexpr int kInFlight = 2;
@@ -53,6 +58,11 @@ private:
     void destroy();
     void run();
     bool submit(int slot);
+    // Under pauseMutex_. Submits both slots. On failure marks the thread stopped.
+    bool submitPair(std::unique_lock<std::mutex>& lock);
+    // Under pauseMutex_. May unlock while a blit fence is waited. False when stopping.
+    bool waitBlitGate(std::unique_lock<std::mutex>& lock);
+    void stopRun(std::unique_lock<std::mutex>& lock);
 
     VkApi vk_;
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -76,9 +86,19 @@ private:
     uint32_t iterations_ = 0;
     std::atomic<bool> quit_ {false};
     bool paused_ = false;  // Under pauseMutex_
+    int inFlight_ = 0;     // Submitted chunks not yet waited. Under pauseMutex_
     std::mutex pauseMutex_;
     std::condition_variable pauseCv_;
     std::thread thread_;
+
+    // Render-device fence the next chunks wait for. Under pauseMutex_.
+    PFN_vkWaitForFences blitWait_ = nullptr;
+    VkDevice blitDevice_ = VK_NULL_HANDLE;
+    VkFence blitFence_ = VK_NULL_HANDLE;
+    uint64_t blitGeneration_ = 0;
+    uint64_t blitWaitedGeneration_ = 0;
+    uint64_t blitWaitingGeneration_ = 0;
+    int blitWaiters_ = 0;
 };
 
 }  // namespace vkr

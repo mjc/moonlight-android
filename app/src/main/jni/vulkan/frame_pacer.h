@@ -109,6 +109,9 @@ public:
     // the last vsync, and not before the last vsync a frame was committed to. The same vsync
     // replaces that frame.
     int64_t plannedVsyncNs(const FrameTiming& frame) const { return frameVsyncNs(frame, true); }
+    // The assigned vsync even when it is too far ahead to commit. 0 before the schedule
+    // has a vsync.
+    int64_t assignedVsyncNs(const FrameTiming& frame) const { return frameVsyncNs(frame, false); }
 
     // How many vsyncs ahead frames may be committed: one slot
     int64_t presentAheadVsyncs() const { return std::clamp<int64_t>(slotVsyncs_, 1, kMaxPresentAheadVsyncs); }

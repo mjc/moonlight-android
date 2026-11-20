@@ -49,6 +49,12 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
     {
         std::lock_guard<std::mutex> lock(pauseMutex_);
         paused_ = false;
+        inFlight_ = 0;
+        blitGeneration_ = 0;
+        blitWaitedGeneration_ = 0;
+        blitWaitingGeneration_ = 0;
+        blitWaiters_ = 0;
+        blitFence_ = VK_NULL_HANDLE;
     }
     thread_ = std::thread(&GpuKeepBusy::run, this);
     ALOGI("Keeping the GPU busy between decodes, %lld us at a time with %u workgroups, at %s priority",
@@ -69,8 +75,101 @@ void GpuKeepBusy::stop() {
 }
 
 void GpuKeepBusy::pause() {
-    std::lock_guard<std::mutex> lock(pauseMutex_);
+    std::unique_lock<std::mutex> lock(pauseMutex_);
+    if (quit_) {
+        return;
+    }
     paused_ = true;
+    pauseCv_.wait(lock, [this] { return quit_.load() || inFlight_ == 0; });
+}
+
+bool GpuKeepBusy::armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation) {
+    if (!wait || device == VK_NULL_HANDLE || fence == VK_NULL_HANDLE || generation == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    if (quit_ || !thread_.joinable()) {
+        return false;
+    }
+    blitWait_ = wait;
+    blitDevice_ = device;
+    blitFence_ = fence;
+    blitGeneration_ = generation;
+    pauseCv_.notify_all();
+    return true;
+}
+
+void GpuKeepBusy::retireBlit(uint64_t generation) {
+    if (generation == 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(pauseMutex_);
+    if (blitWaiters_ > 0 && blitWaitingGeneration_ == generation) {
+        pauseCv_.wait(lock, [this, generation] {
+            return blitWaiters_ == 0 || blitWaitingGeneration_ != generation || quit_.load();
+        });
+    }
+    if (!quit_ && blitGeneration_ == generation) {
+        blitWaitedGeneration_ = generation;
+    }
+}
+
+bool GpuKeepBusy::submitPair(std::unique_lock<std::mutex>& lock) {
+    for (int slot = 0; slot < kInFlight; slot++) {
+        if (!submit(slot)) {
+            ALOGW("Couldn't submit work to keep the GPU busy");
+            stopRun(lock);
+            return false;
+        }
+        inFlight_++;
+    }
+    return true;
+}
+
+bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock) {
+    while (!quit_ && blitWait_ && blitFence_ != VK_NULL_HANDLE && blitGeneration_ != blitWaitedGeneration_) {
+        const uint64_t generation = blitGeneration_;
+        const VkFence fence = blitFence_;
+        const VkDevice device = blitDevice_;
+        const PFN_vkWaitForFences wait = blitWait_;
+        blitWaitingGeneration_ = generation;
+        blitWaiters_ = 1;
+        bool signaled = false;
+        while (!quit_ && !paused_ && blitGeneration_ == generation) {
+            lock.unlock();
+            const VkResult result = wait(device, 1, &fence, VK_TRUE, 20'000'000ULL);
+            lock.lock();
+            if (result == VK_TIMEOUT) {
+                continue;
+            }
+            // Signaled, or the device can no longer signal it. Either way, stop waiting.
+            signaled = true;
+            break;
+        }
+        blitWaiters_ = 0;
+        blitWaitingGeneration_ = 0;
+        pauseCv_.notify_all();
+        if (quit_) {
+            return false;
+        }
+        if (signaled && blitGeneration_ == generation) {
+            blitWaitedGeneration_ = generation;
+        }
+        if (!signaled) {
+            return true;
+        }
+    }
+    return !quit_;
+}
+
+void GpuKeepBusy::stopRun(std::unique_lock<std::mutex>& lock) {
+    // Caller holds pauseMutex_. The argument is the proof, not a second lock.
+    (void)lock;
+    quit_ = true;
+    inFlight_ = 0;
+    blitWaiters_ = 0;
+    blitWaitingGeneration_ = 0;
+    pauseCv_.notify_all();
 }
 
 void GpuKeepBusy::resume() {
@@ -342,13 +441,6 @@ bool GpuKeepBusy::submit(int slot) {
 void GpuKeepBusy::run() {
     // Two dispatches in flight, so the GPU has the next one when one ends. With nothing else to
     // run, they end a chunk apart; the quickest of them are sized to chunkNs_.
-    for (int slot = 0; slot < kInFlight; slot++) {
-        if (!submit(slot)) {
-            ALOGW("Couldn't submit work to keep the GPU busy");
-            return;
-        }
-    }
-
     std::vector<int64_t> intervals;
     intervals.reserve(kSizingWindow);
     int64_t lastDoneNs = nowNs();
@@ -356,9 +448,28 @@ void GpuKeepBusy::run() {
     uint64_t chunks = 0;
     int slot = 0;
     while (!quit_) {
+        {
+            std::unique_lock<std::mutex> lock(pauseMutex_);
+            if (inFlight_ == 0) {
+                pauseCv_.wait(lock, [this] { return !paused_ || quit_.load(); });
+                if (quit_ || !waitBlitGate(lock)) {
+                    return;
+                }
+                if (paused_) {
+                    continue;
+                }
+                if (!submitPair(lock)) {
+                    return;
+                }
+                slot = 0;
+            }
+        }
+
         const VkResult result = vk_.vkWaitForFences(device_, 1, &fences_[slot], VK_TRUE, kFenceTimeoutNs);
         if (result != VK_SUCCESS) {
             ALOGW("Work keeping the GPU busy didn't finish (%d); stopping it", result);
+            std::unique_lock<std::mutex> lock(pauseMutex_);
+            stopRun(lock);
             return;
         }
         const int64_t now = nowNs();
@@ -384,16 +495,32 @@ void GpuKeepBusy::run() {
         }
 
         {
-            // An in-flight chunk has finished. The next one waits out a decode.
             std::unique_lock<std::mutex> lock(pauseMutex_);
-            pauseCv_.wait(lock, [this] { return !paused_ || quit_.load(); });
-        }
-        if (quit_) {
-            return;
-        }
-        if (!submit(slot)) {
-            ALOGW("Couldn't submit work to keep the GPU busy");
-            return;
+            inFlight_--;
+            if (inFlight_ == 0) {
+                pauseCv_.notify_all();
+            }
+            if (quit_) {
+                return;
+            }
+            if (paused_) {
+                // This slot is idle. The other one, if any, is waited on the next pass.
+                slot = (slot + 1) % kInFlight;
+                continue;
+            }
+            if (!waitBlitGate(lock)) {
+                return;
+            }
+            if (paused_ || quit_) {
+                slot = (slot + 1) % kInFlight;
+                continue;
+            }
+            if (!submit(slot)) {
+                ALOGW("Couldn't submit work to keep the GPU busy");
+                stopRun(lock);
+                return;
+            }
+            inFlight_++;
         }
         slot = (slot + 1) % kInFlight;
     }
