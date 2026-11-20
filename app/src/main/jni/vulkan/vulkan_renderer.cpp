@@ -1454,7 +1454,8 @@ bool VulkanRenderer::submitPyrowaveFrame(const PyrowaveBytes& frameBytes, const 
         prioritized = true;
         raiseThreadPriority("PyroWave decode");
     }
-    if (pyrowaveDecodeTid_.exchange(gettid()) != gettid()) {
+    const pid_t decodeTid = gettid();
+    if (pyrowaveDecodeTid_.exchange(decodeTid) != decodeTid) {
         perfHint_.addThread();
     }
     const int64_t startNs = nowNs();
