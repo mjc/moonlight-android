@@ -203,6 +203,43 @@ void* videoPacketAlloc(void) {
     return malloc((size_t)videoPacketBufferSize);
 }
 
+static bool videoPacketAllocBatch(char** packets, int count) {
+    int i;
+    bool needed = false;
+
+    if (videoPacketBufferSize <= 0) {
+        return false;
+    }
+
+    for (i = 0; i < count; i++) {
+        needed |= packets[i] == NULL;
+    }
+    if (!needed) {
+        return true;
+    }
+
+    if (videoPacketSlab != NULL) {
+        PltLockMutex(&videoPacketPoolLock);
+        for (i = 0; i < count && videoPacketFreeHead != NULL; i++) {
+            if (packets[i] == NULL) {
+                packets[i] = (char*)videoPacketFreeHead;
+                memcpy(&videoPacketFreeHead, packets[i], sizeof(videoPacketFreeHead));
+            }
+        }
+        PltUnlockMutex(&videoPacketPoolLock);
+    }
+
+    for (i = 0; i < count; i++) {
+        if (packets[i] == NULL) {
+            packets[i] = (char*)malloc((size_t)videoPacketBufferSize);
+            if (packets[i] == NULL) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void videoPacketFree(void* packet) {
     if (packet == NULL) {
         return;
@@ -516,15 +553,10 @@ static void VideoReceiveThreadProc(void* context) {
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
-        for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
-            if (buffers[i] == NULL) {
-                buffers[i] = (char*)videoPacketAlloc();
-                if (buffers[i] == NULL) {
-                    Limelog("Video Receive: malloc() failed\n");
-                    ListenerCallbacks.connectionTerminated(-1);
-                    goto cleanup;
-                }
-            }
+        if (!videoPacketAllocBatch(buffers, VIDEO_PACKET_RECEIVE_BATCH_SIZE)) {
+            Limelog("Video Receive: malloc() failed\n");
+            ListenerCallbacks.connectionTerminated(-1);
+            goto cleanup;
         }
 
         // Cut the current frame short if it has reached its deadline, and wake up for the
