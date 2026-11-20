@@ -860,13 +860,13 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (length > kMaxPyrowaveFrameBytes) {
         return false;
     }
-    // Same length reuses the slot. A shorter or longer run replaces it with a buffer of
-    // that length. resize would double a buffer that is too small, and the old capacity
-    // would count until the next decode. Higher slots are not in use yet.
+    // Reuse any slot with enough capacity; packet span lengths vary frame to frame. If it
+    // needs to grow, keep the allocation exact so the retained span capacity stays bounded.
+    // Higher slots are not in use yet.
     if (spanCopyUsed_ >= spanCopies_.size()) {
         spanCopies_.emplace_back();
     }
-    if (spanCopies_[spanCopyUsed_].capacity() != length) {
+    if (spanCopies_[spanCopyUsed_].capacity() < length) {
         std::vector<uint8_t> exact(length);
         spanCopies_[spanCopyUsed_].swap(exact);
     }
