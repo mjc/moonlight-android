@@ -482,13 +482,9 @@ namespace {
 
 // Drops the highest slots until kept capacity fits in one frame. The first `keep` slots stay.
 // A push passes keep past the slot it is about to hand out, and earlier pushes still hold theirs.
-void trimSpanCopies(std::deque<std::vector<uint8_t>>& copies, size_t keep) {
-    size_t spanCapacity = 0;
-    for (const std::vector<uint8_t>& copy : copies) {
-        spanCapacity += copy.capacity();
-    }
-    while (spanCapacity > kMaxPyrowaveFrameBytes && copies.size() > keep) {
-        spanCapacity -= copies.back().capacity();
+void trimSpanCopies(std::deque<std::vector<uint8_t>>& copies, size_t keep, size_t& capacity) {
+    while (capacity > kMaxPyrowaveFrameBytes && copies.size() > keep) {
+        capacity -= copies.back().capacity();
         copies.pop_back();
     }
 }
@@ -508,7 +504,7 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     spanPushIndex_ = 0;
     // The previous frame's pointers are dead. A slot that geometric growth left over one
     // frame is dropped here, before this frame pushes.
-    trimSpanCopies(spanCopies_, 0);
+    trimSpanCopies(spanCopies_, 0, spanCopyCapacity_);
     signaledBlit_ = false;
     *times = {};
 
@@ -880,13 +876,15 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
         spanCopies_.emplace_back();
     }
     if (spanCopies_[spanCopyUsed_].capacity() < length) {
+        const size_t oldCapacity = spanCopies_[spanCopyUsed_].capacity();
         std::vector<uint8_t> exact(length);
         spanCopies_[spanCopyUsed_].swap(exact);
+        spanCopyCapacity_ += spanCopies_[spanCopyUsed_].capacity() - oldCapacity;
     }
     else if (spanCopies_[spanCopyUsed_].size() != length) {
         spanCopies_[spanCopyUsed_].resize(length);
     }
-    trimSpanCopies(spanCopies_, spanCopyUsed_ + 1);
+    trimSpanCopies(spanCopies_, spanCopyUsed_ + 1, spanCopyCapacity_);
     uint8_t* copy = spanCopies_[spanCopyUsed_].data();
     if (!frame.at(offset, length, copy, spanPushIndex_)) {
         return false;
