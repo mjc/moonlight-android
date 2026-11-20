@@ -313,8 +313,10 @@ private:
     uint64_t blitDoneValue_ = 0;
     bool blitQuit_ = false;
     // One buffer per run that crosses spans, so a later run cannot reallocate an earlier push.
-    // Cleared on the next decode, after decode_gpu_buffer has returned.
+    // Kept across frames and reused. A push may hold the pointer until decode_gpu_buffer
+    // returns, which is before the next decode.
     std::deque<std::vector<uint8_t>> spanCopies_;
+    size_t spanCopyUsed_ = 0;
 
     // Made as needed, up to kMaxPlanes
     std::mutex poolMutex_;
@@ -323,8 +325,8 @@ private:
     // Pushes the blocks of a frame that arrived whole, skipping the gaps
     bool pushPartialFrame(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount);
     // One accepted run. A run in one span keeps that pointer. A run that crosses spans is copied
-    // into its own buffer in spanCopies_, alive until the next decode: the push may keep the
-    // pointer until decode_gpu_buffer returns, still inside this call.
+    // into a reused buffer in spanCopies_. The push may keep that pointer until
+    // decode_gpu_buffer returns, still inside this call.
     bool pushFrameBytes(const PyrowaveBytes& frame, size_t offset, size_t length);
     // Outside queueMutex_. The draw submit takes that lock. True when stop() released the wait
     // before the draw was queued.

@@ -475,7 +475,7 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     waitedNs_ = 0;
     queueHeldNs_ = 0;
     queueHolds_ = 0;
-    spanCopies_.clear();
+    spanCopyUsed_ = 0;
     signaledBlit_ = false;
     *times = {};
 
@@ -634,6 +634,14 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     if (ownDevice()) {
         recordOwnership(cmd, *planes, true);
     }
+    // Before PyroWave records. Its queue callbacks take queueMutex_, which is the lock the
+    // draw submit needs, and this decode's submit has to follow that draw.
+    bool blitWaitAborted = false;
+    if (info_.shareRenderQueue) {
+        const int64_t blitWaitStartNs = nowNs();
+        blitWaitAborted = waitPreviousBlit();
+        waitedNs_ += nowNs() - blitWaitStartNs;
+    }
     const int64_t recordStartNs = nowNs();
     const int64_t recordStartWaitedNs = waitedNs_;
     api.deviceSetCommandBuffer(device_, cmd);
@@ -656,14 +664,6 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
         return nullptr;
     }
 
-    // The previous frame's draw has to be queued before this submit when they share a queue.
-    // Outside queueMutex_: the thread that submits the draw takes that lock.
-    bool blitWaitAborted = false;
-    if (info_.shareRenderQueue) {
-        const int64_t blitWaitStartNs = nowNs();
-        blitWaitAborted = waitPreviousBlit();
-        waitedNs_ += nowNs() - blitWaitStartNs;
-    }
     if (info_.beforeDecodeSubmit) {
         info_.beforeDecodeSubmit(info_.submitUserdata);
     }
@@ -821,14 +821,20 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (length > kMaxPyrowaveFrameBytes) {
         return false;
     }
-    // Its own buffer: a later crossing run must not move this pointer.
-    spanCopies_.emplace_back(length);
-    uint8_t* dest = spanCopies_.back().data();
-    if (!frame.at(offset, length, dest)) {
-        spanCopies_.pop_back();
+    // Reuse the buffer from the last frame that crossed in this slot. A new vector
+    // zero-fills; a later frame of the same size does not.
+    if (spanCopyUsed_ >= spanCopies_.size()) {
+        spanCopies_.emplace_back();
+    }
+    std::vector<uint8_t>& copy = spanCopies_[spanCopyUsed_];
+    if (copy.size() < length) {
+        copy.resize(length);
+    }
+    if (!frame.at(offset, length, copy.data())) {
         return false;
     }
-    return api.decoderPushPacket(decoder_, dest, length) == PYROWAVE_SUCCESS;
+    spanCopyUsed_++;
+    return api.decoderPushPacket(decoder_, copy.data(), length) == PYROWAVE_SUCCESS;
 }
 
 bool PyrowaveDecoder::waitPreviousBlit() {
