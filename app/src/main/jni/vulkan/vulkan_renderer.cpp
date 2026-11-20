@@ -1396,7 +1396,8 @@ void VulkanRenderer::onImageAvailable() {
         }
         // For traces: when the image was acquired, whether its fence had to be waited for, and
         // when the fence signalled, to tell the decoder still writing it from our wait to wake
-        const int64_t acquiredNs = nowNs();
+        const bool recordTrace = traceRecording_.load(std::memory_order_relaxed);
+        const int64_t acquiredNs = recordTrace ? nowNs() : 0;
         PacerTrace::ImageFence fenceState = PacerTrace::ImageFence::None;
         int64_t signaledNs = 0;
         if (fenceFd >= 0) {
@@ -1414,7 +1415,7 @@ void VulkanRenderer::onImageAvailable() {
             else {
                 fenceState = PacerTrace::ImageFence::Signaled;
             }
-            if (ready > 0 && traceRecording_.load(std::memory_order_relaxed)) {
+            if (ready > 0 && recordTrace) {
                 signaledNs = fenceSignalNs(fenceFd);
             }
             close(fenceFd);
@@ -1437,7 +1438,7 @@ void VulkanRenderer::onImageAvailable() {
         if (ndk_->AImage_getCropRect(image, &frame->crop) != AMEDIA_OK) {
             frame->crop = {0, 0, 0, 0};
         }
-        if (traceRecording_.load(std::memory_order_relaxed)) {
+        if (recordTrace) {
             std::lock_guard<std::mutex> lock(mutex_);
             trace_.imageFence(frame->timing.hostPtsNs, acquiredNs, fenceState, signaledNs, frame->timing.arrivalNs);
         }
