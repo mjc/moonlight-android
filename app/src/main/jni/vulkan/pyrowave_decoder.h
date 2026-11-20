@@ -327,6 +327,7 @@ private:
     // dropped in this call once the kept capacity passes one frame; those pointers are dead.
     std::deque<std::vector<uint8_t>> spanCopies_;
     size_t spanCopyUsed_ = 0;
+    size_t spanPushIndex_ = 0;
 
     // Made as needed, up to kMaxPlanes
     std::mutex poolMutex_;

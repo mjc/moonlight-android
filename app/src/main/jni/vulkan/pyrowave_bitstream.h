@@ -99,6 +99,30 @@ struct PyrowaveBytes {
         return false;
     }
 
+    // Like oneSpan(), for callers that visit packet runs in increasing offset order. The cursor
+    // avoids searching the span list again for each run.
+    bool oneSpan(size_t offset, size_t length, size_t& spanIndex) const {
+        if (length == 0 || spanCount == 0) {
+            return length == 0 || data != nullptr;
+        }
+        const size_t end = offset + length;
+        if (end < offset) {
+            return false;
+        }
+        while (spanIndex < spanCount) {
+            const PyrowaveSpan& span = spans[spanIndex];
+            const size_t spanEnd = span.offset + span.length;
+            if (span.length == 0 || span.data == nullptr || spanEnd < span.offset) {
+                return false;
+            }
+            if (spanEnd > offset) {
+                return span.offset <= offset && end <= spanEnd;
+            }
+            spanIndex++;
+        }
+        return false;
+    }
+
     // Pointer to [offset, length). Into the contiguous buffer or the one span that holds it.
     // Across spans, copied into scratch, which must hold `length` bytes. Null if a byte is absent.
     const uint8_t* at(size_t offset, size_t length, uint8_t* scratch) const {
@@ -497,6 +521,7 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
     // Runs of whole records, pushed as they end
     size_t runStart = SIZE_MAX;
     size_t runEnd = 0;
+    size_t runSpanIndex = 0;
     bool pushed = false;
     const auto flush = [&]() {
         if (runStart != SIZE_MAX) {
@@ -546,7 +571,7 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
             flush();
         }
         else {
-            if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart)) {
+            if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart, runSpanIndex)) {
                 flush();
             }
             if (runStart == SIZE_MAX) {

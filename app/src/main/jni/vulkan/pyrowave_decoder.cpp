@@ -505,6 +505,7 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     queueSubmitTimingEnabled_ = info_.traceRecording != nullptr &&
                                 info_.traceRecording->load(std::memory_order_relaxed);
     spanCopyUsed_ = 0;
+    spanPushIndex_ = 0;
     // The previous frame's pointers are dead. A slot that geometric growth left over one
     // frame is dropped here, before this frame pushes.
     trimSpanCopies(spanCopies_, 0);
@@ -862,8 +863,8 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (length == 0) {
         return true;
     }
-    if (frame.oneSpan(offset, length)) {
-        const uint8_t* bytes = frame.at(offset, length, nullptr);
+    if (frame.oneSpan(offset, length, spanPushIndex_)) {
+        const uint8_t* bytes = frame.at(offset, length, nullptr, spanPushIndex_);
         if (!bytes) {
             return false;
         }
@@ -887,7 +888,7 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     }
     trimSpanCopies(spanCopies_, spanCopyUsed_ + 1);
     uint8_t* copy = spanCopies_[spanCopyUsed_].data();
-    if (!frame.at(offset, length, copy)) {
+    if (!frame.at(offset, length, copy, spanPushIndex_)) {
         return false;
     }
     spanCopyUsed_++;
