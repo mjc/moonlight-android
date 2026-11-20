@@ -64,10 +64,18 @@ namespace {
 
 void PyrowaveDecoder::lockQueue(void* userdata) {
     auto* decoder = static_cast<PyrowaveDecoder*>(userdata);
-    const int64_t startNs = nowNs();
-    decoder->info_.queueMutex->lock();
-    decoder->queueLockedNs_ = nowNs();
-    decoder->waitedNs_ += decoder->queueLockedNs_ - startNs;
+    if (!decoder->info_.queueMutex->try_lock()) {
+        const int64_t startNs = nowNs();
+        decoder->info_.queueMutex->lock();
+        const int64_t lockedNs = nowNs();
+        decoder->waitedNs_ += lockedNs - startNs;
+        if (decoder->queueSubmitTimingEnabled_) {
+            decoder->queueLockedNs_ = lockedNs;
+        }
+    }
+    else if (decoder->queueSubmitTimingEnabled_) {
+        decoder->queueLockedNs_ = nowNs();
+    }
 }
 
 void PyrowaveDecoder::unlockQueue(void* userdata) {
