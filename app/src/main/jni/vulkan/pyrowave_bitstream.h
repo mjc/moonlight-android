@@ -16,6 +16,25 @@ struct PyrowaveGap {
     size_t length;
 };
 
+// Missing ranges and decoder probes are both ordered by frame offset. Advance once through the
+// ranges instead of rescanning every gap for each block or record in a partial frame.
+struct PyrowaveGapScanner {
+    const PyrowaveGap* gaps;
+    size_t count;
+    size_t next = 0;
+
+    bool overlaps(size_t begin, size_t end) {
+        while (next < count) {
+            const PyrowaveGap& gap = gaps[next];
+            if (gap.offset >= begin || gap.length > begin - gap.offset) {
+                break;
+            }
+            next++;
+        }
+        return next < count && gaps[next].offset < end;
+    }
+};
+
 // A stretch that arrived, in order, without the gaps. Pointers stay valid for the decode that
 // walks them and no longer.
 struct PyrowaveSpan {
@@ -177,15 +196,8 @@ bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size
         return frame.at(offset, kHeaderSize, headerScratch);
     };
 
-    // Whether any of [begin, end) is in a gap
-    const auto missing = [&](size_t begin, size_t end) {
-        for (size_t i = 0; i < gapCount; i++) {
-            if (gaps[i].offset < end && begin < gaps[i].offset + gaps[i].length) {
-                return true;
-            }
-        }
-        return false;
-    };
+    PyrowaveGapScanner gapScanner {gaps, gapCount};
+    const auto missing = [&](size_t begin, size_t end) { return gapScanner.overlaps(begin, end); };
 
     // More blocks than a frame of this size can have, to reject garbage
     const uint32_t maxBlocks = (width / 32 + 2) * (height / 32 + 2) * 2;
@@ -401,15 +413,8 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
     const size_t size = frame.size;
     uint8_t headerScratch[kHeaderSize];
 
-    // Whether any of [begin, end) is in a gap
-    const auto missing = [&](size_t begin, size_t end) {
-        for (size_t i = 0; i < gapCount; i++) {
-            if (gaps[i].offset < end && begin < gaps[i].offset + gaps[i].length) {
-                return true;
-            }
-        }
-        return false;
-    };
+    PyrowaveGapScanner gapScanner {gaps, gapCount};
+    const auto missing = [&](size_t begin, size_t end) { return gapScanner.overlaps(begin, end); };
 
     // The first record start after from, or the end if there's none
     size_t nextStart = 0;
