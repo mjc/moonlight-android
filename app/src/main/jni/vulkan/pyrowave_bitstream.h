@@ -16,6 +16,103 @@ struct PyrowaveGap {
     size_t length;
 };
 
+// A stretch that arrived, in order, without the gaps. Pointers stay valid for the decode that
+// walks them and no longer.
+struct PyrowaveSpan {
+    size_t offset;
+    const uint8_t* data;
+    size_t length;
+};
+
+constexpr size_t kMaxPyrowaveFrameBytes = 32u * 1024u * 1024u;
+
+// A frame as one buffer, or as spans. Spans are in order and do not overlap.
+struct PyrowaveBytes {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    const PyrowaveSpan* spans = nullptr;
+    size_t spanCount = 0;
+
+    // True when [offset, length) sits in the contiguous buffer or in one span, so a push can
+    // hand that pointer over. A contiguous frame is one span: its runs stay coalesced.
+    bool oneSpan(size_t offset, size_t length) const {
+        if (length == 0) {
+            return true;
+        }
+        if (spanCount == 0) {
+            return data != nullptr;
+        }
+        const size_t end = offset + length;
+        if (end < offset) {
+            return false;
+        }
+        for (size_t i = 0; i < spanCount; i++) {
+            const PyrowaveSpan& span = spans[i];
+            const size_t spanEnd = span.offset + span.length;
+            if (span.length == 0 || span.data == nullptr || spanEnd < span.offset) {
+                return false;
+            }
+            if (span.offset <= offset && end <= spanEnd) {
+                return true;
+            }
+            if (span.offset > offset) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Pointer to [offset, length). Into the contiguous buffer or the one span that holds it.
+    // Across spans, copied into scratch, which must hold `length` bytes. Null if a byte is absent.
+    const uint8_t* at(size_t offset, size_t length, uint8_t* scratch) const {
+        if (length == 0) {
+            return scratch;
+        }
+        if (spanCount == 0) {
+            if (data == nullptr || offset > size || length > size - offset) {
+                return nullptr;
+            }
+            return data + offset;
+        }
+        const size_t end = offset + length;
+        if (end < offset) {
+            return nullptr;
+        }
+        size_t filled = 0;
+        for (size_t i = 0; i < spanCount; i++) {
+            const PyrowaveSpan& span = spans[i];
+            if (span.length == 0 || span.data == nullptr) {
+                return nullptr;
+            }
+            const size_t spanEnd = span.offset + span.length;
+            if (spanEnd < span.offset) {
+                return nullptr;
+            }
+            if (spanEnd <= offset) {
+                continue;
+            }
+            if (span.offset >= end) {
+                break;
+            }
+            const size_t from = offset > span.offset ? offset : span.offset;
+            const size_t to = end < spanEnd ? end : spanEnd;
+            if (from != offset + filled) {
+                return nullptr;
+            }
+            const size_t n = to - from;
+            if (filled == 0 && to == end) {
+                return span.data + (from - span.offset);
+            }
+            if (scratch == nullptr) {
+                return nullptr;
+            }
+            memcpy(scratch + filled, span.data + (from - span.offset), n);
+            filled += n;
+        }
+        return filled == length ? scratch : nullptr;
+    }
+};
+
 namespace pyrowave_bitstream {
     // PyroWave's bitstream (docs/bitstream.md in PyroWave): an 8 byte header starts the frame,
     // then each 32x32 block of coefficients is a whole number of 32-bit words with an 8 byte
@@ -52,9 +149,15 @@ namespace pyrowave_bitstream {
 // arrived next to each other was never sent. PyroWave needs that to tell when a partial frame
 // still has all of its coarsest blocks.
 template <typename Push>
-bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps, size_t gapCount, uint32_t width,
+bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size_t gapCount, uint32_t width,
                        uint32_t height, std::vector<uint32_t>& lostBlocks, Push push) {
     using namespace pyrowave_bitstream;
+    const size_t size = frame.size;
+    uint8_t headerScratch[kHeaderSize];
+    // Stack scratch only when an 8-byte header crosses a span. The caller uses it before the next read.
+    const auto headerAt = [&](size_t offset) -> const uint8_t* {
+        return frame.at(offset, kHeaderSize, headerScratch);
+    };
 
     // Whether any of [begin, end) is in a gap
     const auto missing = [&](size_t begin, size_t end) {
@@ -94,7 +197,11 @@ bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps
             if (!headerArrived(offset)) {
                 continue;
             }
-            const BlockHeader h = readHeader(data + offset);
+            const uint8_t* hdr = headerAt(offset);
+            if (!hdr) {
+                continue;
+            }
+            const BlockHeader h = readHeader(hdr);
             if (!plausible(h, offset)) {
                 continue;
             }
@@ -102,7 +209,11 @@ bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps
             if (next + kHeaderSize > size || !headerArrived(next)) {
                 return offset;
             }
-            const BlockHeader after = readHeader(data + next);
+            const uint8_t* nextHdr = headerAt(next);
+            if (!nextHdr) {
+                return offset;
+            }
+            const BlockHeader after = readHeader(nextHdr);
             const bool padding = after.payloadWords == 0 && after.blockIndex == 0;
             if (padding || (!after.frameHeader && after.payloadWords * 4 >= kHeaderSize &&
                             after.sequence == h.sequence && after.blockIndex > h.blockIndex &&
@@ -126,6 +237,11 @@ bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps
         }
     };
     const auto extend = [&](size_t begin, size_t end) {
+        // A run stays inside one span. A block that itself crosses is pushed on its own; the
+        // caller copies that block. With no spans, oneSpan is true and runs stay coalesced.
+        if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart)) {
+            flush();
+        }
         if (runStart == SIZE_MAX) {
             runStart = begin;
         }
@@ -141,7 +257,14 @@ bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps
             continue;
         }
 
-        const BlockHeader h = readHeader(data + offset);
+        const uint8_t* hdr = headerAt(offset);
+        if (!hdr) {
+            flush();
+            lostTrack = true;
+            offset = resync(offset + 4);
+            continue;
+        }
+        const BlockHeader h = readHeader(hdr);
         if (h.frameHeader) {
             // Only the frame starts with one
             if (offset == 0) {
@@ -197,8 +320,10 @@ bool pushArrivedBlocks(const uint8_t* data, size_t size, const PyrowaveGap* gaps
 // zero words. PyroWave would take one for a broken frame header. Returns false if the records
 // don't add up to the frame, or push does.
 template <typename Push>
-bool pushRecords(const uint8_t* data, size_t size, Push push) {
+bool pushRecords(const PyrowaveBytes& frame, Push push) {
     using namespace pyrowave_bitstream;
+    const size_t size = frame.size;
+    uint8_t headerScratch[kHeaderSize];
 
     size_t runStart = 0;
     size_t pos = 0;
@@ -206,11 +331,15 @@ bool pushRecords(const uint8_t* data, size_t size, Push push) {
         if (size - pos < kHeaderSize) {
             return false;
         }
+        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch);
+        if (!hdr) {
+            return false;
+        }
         uint32_t first;
-        memcpy(&first, data + pos, sizeof(first));
+        memcpy(&first, hdr, sizeof(first));
         if (first == 0xFFFFFFFFu) {
             uint32_t words;
-            memcpy(&words, data + pos + 4, sizeof(words));
+            memcpy(&words, hdr + 4, sizeof(words));
             if (pos > runStart && !push(runStart, pos - runStart)) {
                 return false;
             }
@@ -222,12 +351,20 @@ bool pushRecords(const uint8_t* data, size_t size, Push push) {
             continue;
         }
 
-        const BlockHeader header = readHeader(data + pos);
+        const BlockHeader header = readHeader(hdr);
         const size_t length = header.frameHeader ? kHeaderSize : 4 * static_cast<size_t>(header.payloadWords);
         if (length < kHeaderSize || length > size - pos) {
             return false;
         }
-        pos += length;
+        const size_t end = pos + length;
+        // Same split as pushArrivedBlocks: complete records in one span stay one push.
+        if (runStart < pos && !frame.oneSpan(runStart, end - runStart)) {
+            if (!push(runStart, pos - runStart)) {
+                return false;
+            }
+            runStart = pos;
+        }
+        pos = end;
     }
     return pos == runStart || push(runStart, pos - runStart);
 }
@@ -240,9 +377,11 @@ bool pushRecords(const uint8_t* data, size_t size, Push push) {
 // block order, so there's no telling where one starts otherwise. Returns whether anything was
 // pushed.
 template <typename Push>
-bool pushArrivedRecords(const uint8_t* data, size_t size, const PyrowaveGap* gaps, size_t gapCount,
+bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size_t gapCount,
                         const size_t* recordStarts, size_t recordStartCount, Push push) {
     using namespace pyrowave_bitstream;
+    const size_t size = frame.size;
+    uint8_t headerScratch[kHeaderSize];
 
     // Whether any of [begin, end) is in a gap
     const auto missing = [&](size_t begin, size_t end) {
@@ -284,17 +423,23 @@ bool pushArrivedRecords(const uint8_t* data, size_t size, const PyrowaveGap* gap
             continue;
         }
 
+        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch);
+        if (!hdr) {
+            flush();
+            pos = resync(pos);
+            continue;
+        }
         uint32_t first;
-        memcpy(&first, data + pos, sizeof(first));
+        memcpy(&first, hdr, sizeof(first));
         const bool padding = first == 0xFFFFFFFFu;
         size_t length;
         if (padding) {
             uint32_t words;
-            memcpy(&words, data + pos + 4, sizeof(words));
+            memcpy(&words, hdr + 4, sizeof(words));
             length = words <= (size - pos - kHeaderSize) / 4 ? kHeaderSize + 4 * static_cast<size_t>(words) : SIZE_MAX;
         }
         else {
-            const BlockHeader header = readHeader(data + pos);
+            const BlockHeader header = readHeader(hdr);
             length = header.frameHeader ? kHeaderSize : 4 * static_cast<size_t>(header.payloadWords);
         }
         if (length < kHeaderSize || length > size - pos) {
@@ -309,6 +454,9 @@ bool pushArrivedRecords(const uint8_t* data, size_t size, const PyrowaveGap* gap
             flush();
         }
         else {
+            if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart)) {
+                flush();
+            }
             if (runStart == SIZE_MAX) {
                 runStart = pos;
             }

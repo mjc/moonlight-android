@@ -423,6 +423,17 @@ bool PyrowaveDecoder::init(int width, int height, bool tenBit) {
                 return false;
             }
         }
+        if (info_.shareRenderQueue) {
+            // Unsignaled until a decode submit. One is enough: the next decode waits until this
+            // one has been waited or dropped, so it cannot signal a second time first.
+            // A failed create leaves the caller's handle undefined, so keep it off blitSem_.
+            VkSemaphoreCreateInfo semaphoreInfo {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            VkSemaphore blitSem = VK_NULL_HANDLE;
+            if (vk_.vkCreateSemaphore(info_.device, &semaphoreInfo, nullptr, &blitSem) != VK_SUCCESS) {
+                return false;
+            }
+            blitSem_ = blitSem;
+        }
     }
 
     ALOGI("Decoding %ux%u %s 4:2:0 on the %s path", width_, height_, tenBit_ ? "10-bit" : "8-bit",
@@ -451,30 +462,31 @@ PyrowaveDecoder::~PyrowaveDecoder() {
     if (timestampPool_) vk_.vkDestroyQueryPool(device, timestampPool_, nullptr);
     if (commandPool_) vk_.vkDestroyCommandPool(device, commandPool_, nullptr);
     if (timeline_) vk_.vkDestroySemaphore(device, timeline_, nullptr);
+    if (blitSem_) vk_.vkDestroySemaphore(device, blitSem_, nullptr);
     if (descriptorPool_) renderVk().vkDestroyDescriptorPool(renderDevice(), descriptorPool_, nullptr);
     if (setLayout_) renderVk().vkDestroyDescriptorSetLayout(renderDevice(), setLayout_, nullptr);
     if (sampler_) renderVk().vkDestroySampler(renderDevice(), sampler_, nullptr);
 }
 
-PyrowavePlanes* PyrowaveDecoder::decode(const uint8_t* data, size_t size, const Gap* gaps, size_t gapCount,
+PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount,
                                         const std::vector<size_t>* recordStarts, Partial partial,
                                         uint64_t* readyValue, DecodeTimes* times) {
     const int64_t startNs = nowNs();
     waitedNs_ = 0;
     queueHeldNs_ = 0;
     queueHolds_ = 0;
+    spanCopies_.clear();
+    signaledBlit_ = false;
     *times = {};
 
     // Each frame arrives on its own, so anything left from an earlier one is stale
     api.decoderClear(decoder_);
 
+    const auto push = [&](size_t offset, size_t length) { return pushFrameBytes(frame, offset, length); };
     if (partial != Partial::None) {
         const bool pushed = recordStarts
-                ? pushArrivedRecords(data, size, gaps, gapCount, recordStarts->data(), recordStarts->size(),
-                                     [&](size_t offset, size_t length) {
-                                         return api.decoderPushPacket(decoder_, data + offset, length) == PYROWAVE_SUCCESS;
-                                     })
-                : pushPartialFrame(data, size, gaps, gapCount);
+                ? pushArrivedRecords(frame, gaps, gapCount, recordStarts->data(), recordStarts->size(), push)
+                : pushPartialFrame(frame, gaps, gapCount);
         if (!pushed) {
             partialDropped_++;
             return nullptr;
@@ -483,9 +495,12 @@ PyrowavePlanes* PyrowaveDecoder::decode(const uint8_t* data, size_t size, const 
     else {
         // Without padding records, that's the whole frame in one go
         pyrowave_result result = PYROWAVE_SUCCESS;
-        const bool pushed = pushRecords(data, size, [&](size_t offset, size_t length) {
-            result = api.decoderPushPacket(decoder_, data + offset, length);
-            return result == PYROWAVE_SUCCESS;
+        const bool pushed = pushRecords(frame, [&](size_t offset, size_t length) {
+            if (!pushFrameBytes(frame, offset, length)) {
+                result = PYROWAVE_ERROR_INVALID_ARGUMENT;
+                return false;
+            }
+            return true;
         });
         if (!pushed && result == PYROWAVE_SUCCESS) {
             result = PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -641,6 +656,18 @@ PyrowavePlanes* PyrowaveDecoder::decode(const uint8_t* data, size_t size, const 
         return nullptr;
     }
 
+    // The previous frame's draw has to be queued before this submit when they share a queue.
+    // Outside queueMutex_: the thread that submits the draw takes that lock.
+    bool blitWaitAborted = false;
+    if (info_.shareRenderQueue) {
+        const int64_t blitWaitStartNs = nowNs();
+        blitWaitAborted = waitPreviousBlit();
+        waitedNs_ += nowNs() - blitWaitStartNs;
+    }
+    if (info_.beforeDecodeSubmit) {
+        info_.beforeDecodeSubmit(info_.submitUserdata);
+    }
+
     // After the decode before it, which may have been into these planes. Only the stage that
     // writes them waits, as PyroWave's own submissions did, so the start of a decode (the
     // fragment path's dequantizing) can overlap the end of the one before. Its start timestamp
@@ -663,6 +690,13 @@ PyrowavePlanes* PyrowaveDecoder::decode(const uint8_t* data, size_t size, const 
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &timeline_;
     }
+    // stop() can release the blit wait before the draw has waited the semaphore. Signaling
+    // again would be a second signal on a binary semaphore, so this decode does not signal one.
+    const bool signalBlit = blitSem_ && !blitWaitAborted;
+    if (signalBlit) {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &blitSem_;
+    }
     VkResult submitted;
     {
         const int64_t lockStartNs = nowNs();
@@ -675,8 +709,16 @@ PyrowavePlanes* PyrowaveDecoder::decode(const uint8_t* data, size_t size, const 
     times->waitedNs = waitedNs_;
     if (submitted != VK_SUCCESS) {
         ALOGE("vkQueueSubmit failed for a decode: %d", submitted);
+        if (info_.decodeSubmitDropped) {
+            info_.decodeSubmitDropped(info_.submitUserdata);
+        }
         release(planes);
         return nullptr;
+    }
+    if (signalBlit) {
+        std::lock_guard<std::mutex> lock(blitSemMutex_);
+        blitSemState_ = 1;
+        signaledBlit_ = true;
     }
     {
         std::lock_guard<std::mutex> lock(timestampMutex_);
@@ -759,10 +801,135 @@ VkResult PyrowaveDecoder::waitDecoded(uint64_t value, uint64_t timeoutNs) {
     return result;
 }
 
-bool PyrowaveDecoder::pushPartialFrame(const uint8_t* data, size_t size, const Gap* gaps, size_t gapCount) {
-    return pushArrivedBlocks(data, size, gaps, gapCount, width_, height_, lostBlocks_, [&](size_t offset, size_t length) {
-        return api.decoderPushPacket(decoder_, data + offset, length) == PYROWAVE_SUCCESS;
+bool PyrowaveDecoder::pushPartialFrame(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount) {
+    return pushArrivedBlocks(frame, gaps, gapCount, width_, height_, lostBlocks_, [&](size_t offset, size_t length) {
+        return pushFrameBytes(frame, offset, length);
     });
+}
+
+bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (frame.oneSpan(offset, length)) {
+        const uint8_t* bytes = frame.at(offset, length, nullptr);
+        if (!bytes) {
+            return false;
+        }
+        return api.decoderPushPacket(decoder_, bytes, length) == PYROWAVE_SUCCESS;
+    }
+    if (length > kMaxPyrowaveFrameBytes) {
+        return false;
+    }
+    // Its own buffer: a later crossing run must not move this pointer.
+    spanCopies_.emplace_back(length);
+    uint8_t* dest = spanCopies_.back().data();
+    if (!frame.at(offset, length, dest)) {
+        spanCopies_.pop_back();
+        return false;
+    }
+    return api.decoderPushPacket(decoder_, dest, length) == PYROWAVE_SUCCESS;
+}
+
+bool PyrowaveDecoder::waitPreviousBlit() {
+    std::unique_lock<std::mutex> lock(blitMutex_);
+    blitCv_.wait(lock, [this] { return blitQuit_ || blitDoneValue_ >= blitNeededValue_; });
+    return blitQuit_ && blitDoneValue_ < blitNeededValue_;
+}
+
+void PyrowaveDecoder::armBlitWait(uint64_t value) {
+    std::lock_guard<std::mutex> lock(blitMutex_);
+    if (value > blitNeededValue_) {
+        blitNeededValue_ = value;
+    }
+}
+
+void PyrowaveDecoder::requestBlitQuit() {
+    std::lock_guard<std::mutex> lock(blitMutex_);
+    blitQuit_ = true;
+    blitCv_.notify_all();
+}
+
+void PyrowaveDecoder::noteBlitSubmitted(uint64_t value) {
+    std::lock_guard<std::mutex> lock(blitMutex_);
+    if (value > blitDoneValue_) {
+        blitDoneValue_ = value;
+    }
+    blitCv_.notify_all();
+}
+
+VkSemaphore PyrowaveDecoder::claimBlitSemaphore(std::atomic<int>& phase) {
+    if (!blitSem_) {
+        return VK_NULL_HANDLE;
+    }
+    int expected = kBlitArmed;
+    if (!phase.compare_exchange_strong(expected, kBlitSemTaken)) {
+        return VK_NULL_HANDLE;
+    }
+    std::lock_guard<std::mutex> lock(blitSemMutex_);
+    if (blitSemState_ != 1) {
+        phase.store(kBlitArmed);
+        return VK_NULL_HANDLE;
+    }
+    blitSemState_ = 2;
+    return blitSem_;
+}
+
+void PyrowaveDecoder::revertBlitSemaphore(std::atomic<int>& phase) {
+    std::lock_guard<std::mutex> lock(blitSemMutex_);
+    blitSemState_ = 1;
+    phase.store(kBlitArmed);
+}
+
+void PyrowaveDecoder::finishSharedBlit(uint64_t value, std::atomic<int>& phase) {
+    const int previous = phase.exchange(kBlitNoted);
+    if (previous == kBlitNoted) {
+        return;
+    }
+    noteBlitSubmitted(value);
+}
+
+void PyrowaveDecoder::abandonSharedBlit(uint64_t value, std::atomic<int>& phase, bool ownsSemaphore) {
+    const int previous = phase.exchange(kBlitNoted);
+    if (previous == kBlitNoted) {
+        return;
+    }
+    // stop() can let the next decode submit before this draw waits. That submit does not signal,
+    // and must not consume the semaphore the earlier decode left signaled.
+    if (previous == kBlitArmed && ownsSemaphore) {
+        consumeBlitSemaphore();
+    }
+    noteBlitSubmitted(value);
+}
+
+void PyrowaveDecoder::consumeBlitSemaphore() {
+    if (!blitSem_) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(blitSemMutex_);
+        if (blitSemState_ != 1) {
+            return;
+        }
+        blitSemState_ = 2;
+    }
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1;
+    submit.pWaitSemaphores = &blitSem_;
+    submit.pWaitDstStageMask = &stage;
+    VkResult result;
+    {
+        std::lock_guard<std::mutex> lock(*info_.queueMutex);
+        result = vk_.vkQueueSubmit(info_.queue, 1, &submit, VK_NULL_HANDLE);
+    }
+    if (result != VK_SUCCESS) {
+        std::lock_guard<std::mutex> lock(blitSemMutex_);
+        if (blitSemState_ == 2) {
+            blitSemState_ = 1;
+        }
+        ALOGE("Dropping a decode's blit semaphore failed: %d", result);
+    }
 }
 
 void PyrowaveDecoder::release(PyrowavePlanes* planes) {

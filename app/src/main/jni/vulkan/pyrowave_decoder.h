@@ -1,8 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -78,8 +80,8 @@ struct PyrowavePlanes {
 //
 // PyroWave (libpyrowave-shared.so, loaded at runtime) records its decode into our commands, which
 // we submit to the device's queue, timed when the queue can be. Each decode signals a timeline
-// semaphore that the render of that frame waits for, or without timeline semaphores, a fence
-// that's waited for before the frame is rendered.
+// semaphore that the render of that frame waits for. Without one, a shared render queue signals
+// a binary semaphore the draw waits on; any other queue is waited on with a fence first.
 class PyrowaveDecoder {
 public:
     // Loads the library and checks it has the API version we were built against. Only tried once.
@@ -109,6 +111,13 @@ public:
         // which is on the decode device, and only once the decode is done.
         VkDevice renderDevice = VK_NULL_HANDLE;
         const VkApi* renderVk = nullptr;
+        // Decode and the draw share `queue`. The draw of frame N is queued before decode N+1.
+        bool shareRenderQueue = false;
+        // Immediately before the decode vkQueueSubmit, after the N-2 wait, and not while
+        // queueMutex is held. decodeSubmitDropped runs if that submit fails.
+        void (*beforeDecodeSubmit)(void* userdata) = nullptr;
+        void (*decodeSubmitDropped)(void* userdata) = nullptr;
+        void* submitUserdata = nullptr;
     };
 
     // Null if PyroWave can't decode on this device. width and height must be even.
@@ -123,8 +132,9 @@ public:
 
     // Three combined image samplers, Y, Cb and Cr, in the planes' descriptor sets
     VkDescriptorSetLayout setLayout() const { return setLayout_; }
-    // On the decode device. Null without timeline semaphores: the render must then wait for the
-    // decode with waitDecoded() before it's submitted, and make the planes' writes visible itself.
+    // On the decode device. Null without timeline semaphores. A shared render queue then signals
+    // a binary semaphore from the decode submit, and the draw waits that. Any other queue waits
+    // with waitDecoded() and makes the planes' writes visible itself.
     VkSemaphore timeline() const { return timeline_; }
     // Waits for the decode that signals value to finish on the GPU. Thread safe.
     VkResult waitDecoded(uint64_t value, uint64_t timeoutNs);
@@ -138,6 +148,32 @@ public:
     // The share of its blocks a frame that lost packets must still have to be decoded, rather
     // than dropped. PyroWave's own default is nine tenths.
     void setLostFrameMinBlocks(float fraction) { lostFrameMinBlocks_ = fraction; }
+
+    // VideoFrame::blitPhase. Armed: this frame's decode has signaled, and the draw has not
+    // taken it. SemTaken: the draw's submit waits the binary semaphore. Noted: the next decode
+    // may be queued.
+    static constexpr int kBlitArmed = 1;
+    static constexpr int kBlitSemTaken = 2;
+    static constexpr int kBlitNoted = 3;
+
+    // Blocks the next decode submit until the draw of `value` has been queued, or the frame dropped.
+    void armBlitWait(uint64_t value);
+    // stop() calls this before joining the thread that submits draws, so a decode waiting on
+    // the blit cannot sit there forever.
+    void requestBlitQuit();
+    // The binary semaphore for this frame, or null if this draw should not wait it (timeline,
+    // a redraw, or a frame that will not be drawn). On a failed queue submit, revert the claim:
+    // a failed vkQueueSubmit does not consume the wait.
+    VkSemaphore claimBlitSemaphore(std::atomic<int>& phase);
+    void revertBlitSemaphore(std::atomic<int>& phase);
+    // The draw and its present have been queued.
+    void finishSharedBlit(uint64_t value, std::atomic<int>& phase);
+    // The frame will not be drawn. When ownsSemaphore, consumes the binary semaphore this
+    // frame's decode signaled, so the next decode can signal it, then lets that decode submit.
+    // A submit that did not signal (stop() released the blit wait first) must not take it.
+    void abandonSharedBlit(uint64_t value, std::atomic<int>& phase, bool ownsSemaphore);
+    // True when the decode just submitted signaled the binary semaphore.
+    bool signaledBlit() const { return signaledBlit_; }
 
     using Gap = PyrowaveGap;
 
@@ -177,7 +213,7 @@ public:
     // in order. moonlight-common-c only delivers one if the packets holding its lowest frequency
     // blocks arrived, so it's decoded with whatever else did. Otherwise recordStarts is null, and
     // its blocks are in order.
-    PyrowavePlanes* decode(const uint8_t* data, size_t size, const Gap* gaps, size_t gapCount,
+    PyrowavePlanes* decode(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount,
                            const std::vector<size_t>* recordStarts, Partial partial, uint64_t* readyValue,
                            DecodeTimes* times);
 
@@ -265,13 +301,36 @@ private:
     // semaphores, null, and the values only count submissions.
     VkSemaphore timeline_ = VK_NULL_HANDLE;
     uint64_t lastValue_ = 0;
+    // Shared queue, no timeline. Signaled by the decode submit and waited by one draw.
+    // Idle until that submit: createPlanes signals the timeline only.
+    VkSemaphore blitSem_ = VK_NULL_HANDLE;
+    std::mutex blitSemMutex_;
+    int blitSemState_ = 0;  // 0 idle, 1 signaled, 2 consumed. Under blitSemMutex_.
+    bool signaledBlit_ = false;  // The decode in progress signaled blitSem_.
+    std::mutex blitMutex_;
+    std::condition_variable blitCv_;
+    uint64_t blitNeededValue_ = 0;
+    uint64_t blitDoneValue_ = 0;
+    bool blitQuit_ = false;
+    // One buffer per run that crosses spans, so a later run cannot reallocate an earlier push.
+    // Cleared on the next decode, after decode_gpu_buffer has returned.
+    std::deque<std::vector<uint8_t>> spanCopies_;
 
     // Made as needed, up to kMaxPlanes
     std::mutex poolMutex_;
     std::vector<std::unique_ptr<PyrowavePlanes>> planes_;
 
     // Pushes the blocks of a frame that arrived whole, skipping the gaps
-    bool pushPartialFrame(const uint8_t* data, size_t size, const Gap* gaps, size_t gapCount);
+    bool pushPartialFrame(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount);
+    // One accepted run. A run in one span keeps that pointer. A run that crosses spans is copied
+    // into its own buffer in spanCopies_, alive until the next decode: the push may keep the
+    // pointer until decode_gpu_buffer returns, still inside this call.
+    bool pushFrameBytes(const PyrowaveBytes& frame, size_t offset, size_t length);
+    // Outside queueMutex_. The draw submit takes that lock. True when stop() released the wait
+    // before the draw was queued.
+    bool waitPreviousBlit();
+    void noteBlitSubmitted(uint64_t value);
+    void consumeBlitSemaphore();
 
     bool loggedFailure_ = false;
     int64_t lastStatsNs_ = 0;

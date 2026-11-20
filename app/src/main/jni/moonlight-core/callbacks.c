@@ -199,9 +199,15 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     PyrowaveFrameSubmitFn submit;
     void* submitContext;
 
-    // One copy into the renderer's storage. The Java path copies the frame into a byte
-    // array and then copies it back out.
+    // The native path decodes from the entries in place. The Java path copies the frame into
+    // a byte array and then copies it back out.
     if (beginPyrowaveSubmit(&submit, &submitContext)) {
+        ret = submit(decodeUnit, submitContext);
+        if ((*env)->ExceptionCheck(env)) {
+            endPyrowaveSubmit();
+            (*JVM)->DetachCurrentThread(JVM);
+            return DR_OK;
+        }
         (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrAccountPyrowaveFrameMethod,
                                       decodeUnit->frameNumber, decodeUnit->frameType,
                                       (jchar)decodeUnit->frameHostProcessingLatency,
@@ -212,8 +218,6 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
             (*JVM)->DetachCurrentThread(JVM);
             return DR_OK;
         }
-
-        ret = submit(decodeUnit, submitContext);
         endPyrowaveSubmit();
         return ret;
     }

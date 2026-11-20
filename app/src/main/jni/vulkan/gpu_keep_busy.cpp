@@ -46,6 +46,10 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
         return false;
     }
     quit_ = false;
+    {
+        std::lock_guard<std::mutex> lock(pauseMutex_);
+        paused_ = false;
+    }
     thread_ = std::thread(&GpuKeepBusy::run, this);
     ALOGI("Keeping the GPU busy between decodes, %lld us at a time with %u workgroups, at %s priority",
           static_cast<long long>(chunkNs_ / 1000), groups_, lowPriority_ ? "low" : "the default");
@@ -54,10 +58,28 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
 
 void GpuKeepBusy::stop() {
     if (thread_.joinable()) {
-        quit_ = true;
+        {
+            std::lock_guard<std::mutex> lock(pauseMutex_);
+            quit_ = true;
+        }
+        pauseCv_.notify_all();
         thread_.join();
     }
     destroy();
+}
+
+void GpuKeepBusy::pause() {
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    paused_ = true;
+}
+
+void GpuKeepBusy::resume() {
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    if (!paused_) {
+        return;
+    }
+    paused_ = false;
+    pauseCv_.notify_all();
 }
 
 bool GpuKeepBusy::createDevice(VkPhysicalDevice physicalDevice, uint32_t queueFamily, const char* globalPriorityExt) {
@@ -361,6 +383,14 @@ void GpuKeepBusy::run() {
             intervals.clear();
         }
 
+        {
+            // An in-flight chunk has finished. The next one waits out a decode.
+            std::unique_lock<std::mutex> lock(pauseMutex_);
+            pauseCv_.wait(lock, [this] { return !paused_ || quit_.load(); });
+        }
+        if (quit_) {
+            return;
+        }
         if (!submit(slot)) {
             ALOGW("Couldn't submit work to keep the GPU busy");
             return;

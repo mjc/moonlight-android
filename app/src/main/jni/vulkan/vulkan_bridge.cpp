@@ -12,27 +12,26 @@ using vkr::VulkanRenderer;
 
 namespace {
 
-constexpr int kMaxPyrowaveFrameBytes = 32 * 1024 * 1024;
-
-// Copies one PyroWave frame into a contiguous buffer. BUFFER_TYPE_MISSING entries are holes:
-// their data pointer is null and their length is the hole. RECORD_START entries are picture
-// bytes that begin a record. The logical frame is fullLength bytes, and anything past the
-// last entry is also missing.
+// BUFFER_TYPE_MISSING entries are holes: their data pointer is null and their length is the hole.
+// RECORD_START entries are picture bytes that begin a record. The logical frame is fullLength
+// bytes, and anything past the last entry is also missing. The decode runs before this returns,
+// so entry->data stays valid through it and is not kept after.
 extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) {
     auto* renderer = static_cast<VulkanRenderer*>(context);
     if (renderer == nullptr || decodeUnit == nullptr || decodeUnit->bufferList == nullptr || decodeUnit->fullLength <= 0) {
         return DR_OK;
     }
-    if (decodeUnit->fullLength > kMaxPyrowaveFrameBytes) {
+    if (static_cast<size_t>(decodeUnit->fullLength) > vkr::kMaxPyrowaveFrameBytes) {
         __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame is %d bytes, skipping it", decodeUnit->fullLength);
         return DR_OK;
     }
 
     const size_t fullLength = static_cast<size_t>(decodeUnit->fullLength);
-    static thread_local std::vector<uint8_t> frame;
+    static thread_local std::vector<uint8_t> contiguous;
+    static thread_local std::vector<vkr::PyrowaveSpan> spans;
     static thread_local std::vector<vkr::PyrowaveDecoder::Gap> gaps;
     static thread_local std::vector<size_t> recordStarts;
-    frame.resize(fullLength);
+    spans.clear();
     gaps.clear();
     recordStarts.clear();
 
@@ -49,11 +48,10 @@ extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) 
         }
         const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
         if (missing) {
-            memset(frame.data() + offset, 0, length);
             gaps.push_back({offset, length});
         }
         else {
-            memcpy(frame.data() + offset, entry->data, length);
+            spans.push_back({offset, reinterpret_cast<const uint8_t*>(entry->data), length});
             if (entry->bufferType == BUFFER_TYPE_RECORD_START) {
                 recordStarts.push_back(offset);
             }
@@ -61,7 +59,6 @@ extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) 
         offset += length;
     }
     if (offset < fullLength) {
-        memset(frame.data() + offset, 0, fullLength - offset);
         gaps.push_back({offset, fullLength - offset});
     }
 
@@ -70,18 +67,41 @@ extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) 
         partial = decodeUnit->partialLate ? vkr::PyrowaveDecoder::Partial::Cut : vkr::PyrowaveDecoder::Partial::Lost;
     }
 
-    renderer->noteReceived(
-            static_cast<int64_t>(decodeUnit->presentationTimeUs) * 1000,
+    vkr::PyrowaveBytes bytes;
+    // pushRecords reads every byte of a non-partial frame, including a hole filled with zeros.
+    // A span walk would skip that hole, so this case stays on the contiguous buffer.
+    if (partial == vkr::PyrowaveDecoder::Partial::None && !gaps.empty()) {
+        contiguous.resize(fullLength);
+        size_t copyAt = 0;
+        for (PLENTRY entry = decodeUnit->bufferList; entry != nullptr; entry = entry->next) {
+            const size_t length = static_cast<size_t>(entry->length);
+            const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
+            if (missing) {
+                memset(contiguous.data() + copyAt, 0, length);
+            }
+            else {
+                memcpy(contiguous.data() + copyAt, entry->data, length);
+            }
+            copyAt += length;
+        }
+        if (copyAt < fullLength) {
+            memset(contiguous.data() + copyAt, 0, fullLength - copyAt);
+        }
+        bytes = {contiguous.data(), contiguous.size(), nullptr, 0};
+    }
+    else {
+        bytes = {nullptr, fullLength, spans.empty() ? nullptr : spans.data(), spans.size()};
+    }
+
+    const VulkanRenderer::PyrowaveFrameTiming timing {
             static_cast<int64_t>(decodeUnit->receiveTimeUs) * 1000,
             static_cast<int64_t>(decodeUnit->enqueueTimeUs) * 1000,
-            static_cast<int64_t>(decodeUnit->frameHostProcessingLatency) * 100000);
-    renderer->submitPyrowaveFrame(
-            frame.data(), frame.size(),
-            gaps.empty() ? nullptr : gaps.data(), gaps.size(),
-            decodeUnit->partialRecords ? &recordStarts : nullptr,
-            partial,
-            static_cast<int64_t>(decodeUnit->presentationTimeUs) * 1000,
-            static_cast<int64_t>(decodeUnit->enqueueTimeUs));
+            static_cast<int64_t>(decodeUnit->frameHostProcessingLatency) * 100000,
+    };
+    renderer->submitPyrowaveFrame(bytes, gaps.empty() ? nullptr : gaps.data(), gaps.size(),
+                                  decodeUnit->partialRecords ? &recordStarts : nullptr, partial,
+                                  static_cast<int64_t>(decodeUnit->presentationTimeUs) * 1000,
+                                  static_cast<int64_t>(decodeUnit->enqueueTimeUs), &timing);
     return DR_OK;
 }
 
@@ -247,7 +267,8 @@ Java_com_limelight_binding_video_VulkanRendererBridge_nativeSubmitPyrowaveFrame(
         }
     }
 
-    return renderer->submitPyrowaveFrame(frame.data(), frame.size(), gaps.data(), gaps.size(),
+    const vkr::PyrowaveBytes bytes {frame.data(), frame.size(), nullptr, 0};
+    return renderer->submitPyrowaveFrame(bytes, gaps.data(), gaps.size(),
                                          recordStartOffsets ? &recordStarts : nullptr,
                                          static_cast<vkr::PyrowaveDecoder::Partial>(partialKind), hostPtsUs * 1000,
                                          lastPacketUs)

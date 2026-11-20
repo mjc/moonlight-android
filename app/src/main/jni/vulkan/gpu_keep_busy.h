@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 
 #include "vk_api.h"
@@ -18,8 +20,9 @@ namespace vkr {
 // Short compute dispatches run back to back, two in flight, on a queue of their own on a device
 // of their own, at low global priority where the driver allows, so decodes and draws go ahead
 // of them at the next dispatch at the latest. Each is sized to about chunkNs, from how often they
-// finish. It costs power: the GPU runs at its top clock the whole time, so it's only switched on
-// by adb shell setprop debug.moonlight.gpu_keep_busy 1.
+// finish. It costs power: the GPU runs at its top clock the whole time. The PyroWave GPU boost
+// setting switches it on (on by default); adb shell setprop debug.moonlight.gpu_keep_busy
+// overrides that setting.
 //
 // The priority doesn't keep a dispatch from running alongside a decode on the GPU's other cores:
 // with 256 workgroups, enough for all of them, the Pixel 10 Pro stayed at 1094 MHz and decodes
@@ -37,6 +40,9 @@ public:
                const char* globalPriorityExt, int64_t chunkNs, uint32_t groups);
     // Waits for the work in flight, then frees everything. Safe to call more than once.
     void stop();
+    // No new chunks until resume(). One already submitted still finishes.
+    void pause();
+    void resume();
 
 private:
     static constexpr int kInFlight = 2;
@@ -69,6 +75,9 @@ private:
     uint32_t groups_ = 0;
     uint32_t iterations_ = 0;
     std::atomic<bool> quit_ {false};
+    bool paused_ = false;  // Under pauseMutex_
+    std::mutex pauseMutex_;
+    std::condition_variable pauseCv_;
     std::thread thread_;
 };
 

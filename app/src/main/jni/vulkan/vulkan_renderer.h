@@ -54,6 +54,9 @@ struct VideoFrame {
     VideoFrame(PyrowaveDecoder* decoder, PyrowavePlanes* planes, uint64_t readyValue)
         : pyrowave(decoder), planes(planes), readyValue(readyValue) {}
     ~VideoFrame() {
+        if (sharedBlit && pyrowave) {
+            pyrowave->abandonSharedBlit(readyValue, blitPhase, ownsBlitSem);
+        }
         if (image) ndk->AImage_delete(image);
         if (planes) pyrowave->release(planes);
     }
@@ -67,6 +70,12 @@ struct VideoFrame {
     PyrowaveDecoder* pyrowave = nullptr;
     PyrowavePlanes* planes = nullptr;
     uint64_t readyValue = 0;  // Timeline value the decode into the planes signals
+    // Decode shares the render queue. blitPhase is PyrowaveDecoder::kBlit*.
+    // ownsBlitSem: this decode signaled the binary semaphore. Timeline waits have none, and a
+    // submit after stop() released the blit wait did not signal, so it must not take one.
+    bool sharedBlit = false;
+    bool ownsBlitSem = false;
+    std::atomic<int> blitPhase {0};
     int64_t decodeStartNs = 0;   // Handed to the renderer
     int64_t decodeQueuedNs = 0;  // Decode queued on the GPU
     PyrowaveDecoder::DecodeTimes decodeTimes;  // Where the time until then went
@@ -109,16 +118,25 @@ public:
     // Surface MediaCodec writes into. Owned by the renderer. Null for PyroWave.
     ANativeWindow* decoderWindow() const { return decoderWindow_; }
 
+    // When the frame arrived, for the native submit path. Null on the Java path, which calls
+    // noteReceived before the frame exists.
+    struct PyrowaveFrameTiming {
+        int64_t receiveNs = 0;
+        int64_t enqueueNs = 0;
+        int64_t hostProcessingNs = 0;
+    };
+
     // Decodes a PyroWave frame, which may have lost some of its data (gaps) or been cut short,
     // and queues it to be shown. lastPacketUs is when its last packet arrived, on
-    // moonlight-common-c's clock. False if it couldn't be decoded.
+    // moonlight-common-c's clock. False if it couldn't be decoded. `timing` stores the capture
+    // origin on the frame; the Java path leaves it null and uses noteReceived.
     //
     // Also tells moonlight-common-c when to cut short frames still arriving (see
     // updatePartialDeadline()). It's called on moonlight-common-c's decoder thread, which stops
     // before the video stream does.
-    bool submitPyrowaveFrame(const uint8_t* data, size_t size, const PyrowaveDecoder::Gap* gaps, size_t gapCount,
+    bool submitPyrowaveFrame(const PyrowaveBytes& frame, const PyrowaveDecoder::Gap* gaps, size_t gapCount,
                              const std::vector<size_t>* recordStarts, PyrowaveDecoder::Partial partial,
-                             int64_t hostPtsNs, int64_t lastPacketUs);
+                             int64_t hostPtsNs, int64_t lastPacketUs, const PyrowaveFrameTiming* timing = nullptr);
 
     void setHdrMode(bool enabled, const uint8_t* metadata, size_t metadataLength);
 
@@ -256,8 +274,10 @@ private:
 
     static void onImageAvailableThunk(void* context, AImageReader* reader);
     void onImageAvailable();
-    // Queues a decoded frame for the pacer, from the thread that decoded it
-    void enqueueFrame(FramePtr frame);
+    // Queues a decoded frame for the pacer, from the thread that decoded it.
+    // countLatency is false when the shared-queue path still has the decode fence to wait:
+    // the pacer's arrival is this handoff, and the decode latency is counted after the fence.
+    void enqueueFrame(FramePtr frame, bool countLatency = true);
     void wake(uint32_t flags);
 
     // showVsyncNs is the vsync the frame is shown for (the current one if 0); ahead marks a
@@ -418,14 +438,18 @@ private:
     VkPipelineLayout planarPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline planarPipeline_ = VK_NULL_HANDLE;
 
-    // PyroWave frames whose decode is queued on the GPU. A thread waits for each to finish
-    // before it goes to the pacer, as MediaCodec's frames do, so the pacer times frames that can
-    // be shown, and the thread handing frames over is free to decode the next.
+    // PyroWave frames whose decode is queued on the GPU. The waiting thread times each once the
+    // GPU is done. When decode shares the render queue, the frame is handed to the pacer first
+    // so its draw is queued before the next decode; the fence wait is only for that timing.
     std::thread pyrowaveWaiter_;
     std::mutex decodingMutex_;
     std::condition_variable decodingCv_;
     std::deque<FramePtr> decoding_;
     bool decodingQuit_ = false;
+    // Decodes whose vkQueueSubmit has paused GpuKeepBusy and whose fence wait has not returned.
+    // The pause clears only when this is zero and decoding_ is empty.
+    int outstandingDecodes_ = 0;
+    bool pyrowaveSharesQueue_ = false;
 
     // Per frame in flight
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
@@ -601,14 +625,25 @@ private:
     std::atomic<uint32_t> presentedFrames_ {0};
     std::atomic<int64_t> decodedNs_ {0};
 
-    // Capture latency statistics. Frames' origins wait here, by host timestamp, until they're
-    // decoded.
+    // Capture latency statistics. The Java path records an origin here, by host timestamp, because
+    // noteReceived runs before the VideoFrame exists. The native submit path stores it on the frame.
     struct FrameOrigin {
         int64_t ns;
         bool synced;
     };
-    void noteDecoded(VideoFrame& frame);
+    void noteDecoded(VideoFrame& frame, int64_t decodedAtNs, bool count);
+    FrameOrigin frameOrigin(int64_t hostPtsNs, int64_t receiveNs, int64_t hostProcessingNs, int64_t* queuedNs,
+                            int64_t* commonToLocalNs);
+    void traceReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t enqueueNs, int64_t queuedNs,
+                       int64_t commonToLocalNs, int64_t hostProcessingNs);
     void countLatency(LatencySpan& span, int64_t latencyNs, bool synced);
+    // Pause keep-busy around a decode submit. beforeDecodeSubmit runs after the shared-queue
+    // blit wait and before vkQueueSubmit. finishOutstandingDecode runs once that submit's fence
+    // wait has returned, or the submit failed, or the frame was not queued.
+    void beforeDecodeSubmit();
+    void finishOutstandingDecode();
+    static void beforeDecodeSubmitThunk(void* userdata);
+    static void decodeSubmitDroppedThunk(void* userdata);
     std::mutex latencyMutex_;
     std::map<int64_t, FrameOrigin> origins_;
     CaptureLatency captureLatency_;

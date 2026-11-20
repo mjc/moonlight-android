@@ -969,6 +969,11 @@ bool VulkanRenderer::createPyrowaveDecoder() {
         ALOGI("PyroWave decodes on its own queue, %s rendering",
               deviceSetup_.priorities[0] < deviceSetup_.priorities[1] ? "below" : "level with");
     }
+    pyrowaveSharesQueue_ = !decodeQueue_ && !decodeDevice_;
+    info.shareRenderQueue = pyrowaveSharesQueue_;
+    info.beforeDecodeSubmit = &VulkanRenderer::beforeDecodeSubmitThunk;
+    info.decodeSubmitDropped = &VulkanRenderer::decodeSubmitDroppedThunk;
+    info.submitUserdata = this;
     pyrowave_ = PyrowaveDecoder::create(decodeDevice_ ? decodeVk_ : vk_, info, config_.streamWidth,
                                         config_.streamHeight, config_.tenBit);
     if (!pyrowave_) {
@@ -1008,13 +1013,34 @@ void VulkanRenderer::pyrowaveWaiterMain() {
             decoding_.pop_front();
         }
 
+        // The draw is queued before the fence wait, so the next decode can follow it on this queue.
+        // The pacer's arrival is that handoff. Decode latency and the partial-frame deadline use
+        // the time the fence actually returns.
+        const bool shareQueue = pyrowaveSharesQueue_;
+        if (shareQueue) {
+            frame->timing.arrivalNs = nowNs();
+            noteDecoded(*frame, frame->timing.arrivalNs, false);
+            FramePtr held = frame;
+            enqueueFrame(std::move(frame), false);
+            // Nothing queued the frame (the renderer is closing, or the draw was not submitted).
+            // This ref is only for the timing below; drop the blit wait before that fence.
+            if (held.use_count() == 1) {
+                pyrowave_->abandonSharedBlit(held->readyValue, held->blitPhase, held->ownsBlitSem);
+            }
+            frame = std::move(held);
+        }
+
         const VkResult result = pyrowave_->waitDecoded(frame->readyValue, kFenceTimeoutNs);
+        finishOutstandingDecode();
         if (result != VK_SUCCESS) {
             ALOGE("PyroWave decode didn't finish: %d", result);
             continue;
         }
 
-        frame->timing.arrivalNs = nowNs();
+        const int64_t doneNs = nowNs();
+        if (!shareQueue) {
+            frame->timing.arrivalNs = doneNs;
+        }
 
         // What decoding took, without the waits: the CPU's share of it, then its run on the GPU.
         // A decode can start on the GPU before the one before ends, so its run is counted from
@@ -1032,15 +1058,28 @@ void VulkanRenderer::pyrowaveWaiterMain() {
             lastDecodeGpuEndNs_ = std::max(gpuEndNs, lastDecodeGpuEndNs_);
         }
         else {
-            decodedNs_ += frame->timing.arrivalNs - frame->decodeStartNs;
+            decodedNs_ += doneNs - frame->decodeStartNs;
         }
         // Without a trace, this needn't hold up the render thread
         if (traceRecording_.load(std::memory_order_relaxed)) {
             std::lock_guard<std::mutex> lock(mutex_);
-            trace_.decoded(frame->timing.hostPtsNs, frame->decodeStartNs, frame->decodeQueuedNs,
-                           frame->timing.arrivalNs, frame->decodeTimes, gpuStartNs, gpuEndNs);
+            trace_.decoded(frame->timing.hostPtsNs, frame->decodeStartNs, frame->decodeQueuedNs, doneNs,
+                           frame->decodeTimes, gpuStartNs, gpuEndNs);
         }
-        enqueueFrame(std::move(frame));
+        if (shareQueue) {
+            noteDecoded(*frame, doneNs, true);
+            std::lock_guard<std::mutex> lock(mutex_);
+            const int64_t savedArrivalNs = frame->timing.arrivalNs;
+            frame->timing.arrivalNs = doneNs;
+            if (frame->lastPacketUs != 0) {
+                updatePartialDeadline(*frame);
+            }
+            lastDecodedNs_ = doneNs;
+            frame->timing.arrivalNs = savedArrivalNs;
+        }
+        else {
+            enqueueFrame(std::move(frame));
+        }
     }
 }
 
@@ -1144,6 +1183,9 @@ void VulkanRenderer::stop() {
     }
     stopped_ = true;
 
+    if (pyrowave_) {
+        pyrowave_->requestBlitQuit();
+    }
     keepBusy_.stop();
 
     if (renderThread_.joinable()) {
@@ -1390,9 +1432,10 @@ void VulkanRenderer::onImageAvailable() {
     }
 }
 
-bool VulkanRenderer::submitPyrowaveFrame(const uint8_t* data, size_t size, const PyrowaveDecoder::Gap* gaps,
+bool VulkanRenderer::submitPyrowaveFrame(const PyrowaveBytes& frameBytes, const PyrowaveDecoder::Gap* gaps,
                                          size_t gapCount, const std::vector<size_t>* recordStarts,
-                                         PyrowaveDecoder::Partial partial, int64_t hostPtsNs, int64_t lastPacketUs) {
+                                         PyrowaveDecoder::Partial partial, int64_t hostPtsNs, int64_t lastPacketUs,
+                                         const PyrowaveFrameTiming* timing) {
     // Frames queue up behind this thread, so it gets the render thread's priority
     static thread_local bool prioritized = false;
     if (!prioritized) {
@@ -1405,6 +1448,18 @@ bool VulkanRenderer::submitPyrowaveFrame(const uint8_t* data, size_t size, const
     const int64_t startNs = nowNs();
     if (!pyrowave_) {
         return false;
+    }
+    int64_t originNs = 0;
+    bool originSynced = false;
+    if (timing) {
+        int64_t queuedNs = 0;
+        int64_t commonToLocalNs = 0;
+        const FrameOrigin origin = frameOrigin(hostPtsNs, timing->receiveNs, timing->hostProcessingNs, &queuedNs,
+                                               &commonToLocalNs);
+        originNs = origin.ns;
+        originSynced = origin.synced;
+        traceReceived(hostPtsNs, timing->receiveNs, timing->enqueueNs, queuedNs, commonToLocalNs,
+                      timing->hostProcessingNs);
     }
     bool deadlineEnabled;
     int64_t deadlineOffsetUs;
@@ -1427,32 +1482,47 @@ bool VulkanRenderer::submitPyrowaveFrame(const uint8_t* data, size_t size, const
 
     uint64_t readyValue = 0;
     PyrowaveDecoder::DecodeTimes times;
-    PyrowavePlanes* planes = pyrowave_->decode(data, size, gaps, gapCount, recordStarts, partial,
-                                               &readyValue, &times);
+    PyrowavePlanes* planes = pyrowave_->decode(frameBytes, gaps, gapCount, recordStarts, partial, &readyValue, &times);
     if (!planes) {
         return false;
     }
 
-    // The decode is only queued on the GPU. The waiting thread passes the frame on once it's done.
+    // The decode is only queued on the GPU. On a shared queue the waiting thread hands it to the
+    // pacer before the fence, so the draw is submitted before the next decode.
     auto frame = std::make_shared<VideoFrame>(pyrowave_.get(), planes, readyValue);
     frame->timing.hostPtsNs = hostPtsNs;
     frame->decodeStartNs = startNs;
     frame->decodeQueuedNs = nowNs();
     frame->decodeTimes = times;
     frame->lastPacketUs = lastPacketUs;
+    frame->originNs = originNs;
+    frame->originSynced = originSynced;
+    if (pyrowaveSharesQueue_) {
+        frame->sharedBlit = true;
+        frame->ownsBlitSem = pyrowave_->signaledBlit();
+        frame->blitPhase.store(PyrowaveDecoder::kBlitArmed);
+    }
+    bool queued = false;
     {
         std::lock_guard<std::mutex> lock(decodingMutex_);
-        if (decodingQuit_) {
-            return false;
+        if (!decodingQuit_) {
+            decoding_.push_back(std::move(frame));
+            queued = true;
         }
-        decoding_.push_back(std::move(frame));
+    }
+    if (!queued) {
+        finishOutstandingDecode();
+        return false;
+    }
+    if (pyrowaveSharesQueue_) {
+        pyrowave_->armBlitWait(readyValue);
     }
     decodingCv_.notify_one();
     return true;
 }
 
-void VulkanRenderer::enqueueFrame(FramePtr frame) {
-    noteDecoded(*frame);
+void VulkanRenderer::enqueueFrame(FramePtr frame, bool countLatency) {
+    noteDecoded(*frame, frame->timing.arrivalNs, countLatency);
 
     std::deque<FramePtr> dropped;
     {
@@ -1461,10 +1531,12 @@ void VulkanRenderer::enqueueFrame(FramePtr frame) {
             return;
         }
         pacer_.onFrameArrived(frame->timing);
-        if (frame->lastPacketUs != 0) {
+        if (countLatency && frame->lastPacketUs != 0) {
             updatePartialDeadline(*frame);
         }
-        lastDecodedNs_ = frame->timing.arrivalNs;
+        if (countLatency) {
+            lastDecodedNs_ = frame->timing.arrivalNs;
+        }
         trace_.frame(frame->timing, pending_.size() + 1, queueOverflowDrops_);
         pending_.push_back(std::move(frame));
         while (pending_.size() > pacer_.maxQueued()) {
@@ -2190,9 +2262,16 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
         vk_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  0, 0, nullptr, 0, nullptr, 3, planeBarriers);
     }
-    // Without timeline semaphores, nothing below waits for the decode on the GPU: it was waited
-    // for on its fence before the frame got here, and this makes its writes visible
-    const bool waitDecode = planar && !ownDecodeDevice && pyrowave_->timeline() != VK_NULL_HANDLE;
+    // Timeline: the draw waits the decode semaphore at the fragment stage. Shared queue without
+    // one: the same wait on the binary semaphore the decode submit signaled. A redraw has already
+    // consumed that semaphore, so the barrier below makes the writes visible instead. Any other
+    // queue without a timeline waited on the fence before the frame got here.
+    const bool waitTimeline = planar && !ownDecodeDevice && pyrowave_->timeline() != VK_NULL_HANDLE;
+    VkSemaphore blitSemaphore = VK_NULL_HANDLE;
+    if (planar && frame->sharedBlit && frame->ownsBlitSem && !waitTimeline) {
+        blitSemaphore = pyrowave_->claimBlitSemaphore(frame->blitPhase);
+    }
+    const bool waitDecode = waitTimeline || blitSemaphore != VK_NULL_HANDLE;
     if (planar && !ownDecodeDevice && !waitDecode) {
         VkMemoryBarrier decoded {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         decoded.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2259,7 +2338,8 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     // for the image, so the start timestamp shows when it was free; only a draw's vertex work
     // could otherwise go ahead of it, which for one triangle is nothing. A decode on a device of
     // its own was waited for before the frame got here, and its timeline is on that device.
-    const VkSemaphore waitSemaphores[2] = {imageAcquired_[slot], waitDecode ? pyrowave_->timeline() : VK_NULL_HANDLE};
+    const VkSemaphore waitSemaphores[2] = {
+            imageAcquired_[slot], waitTimeline ? pyrowave_->timeline() : blitSemaphore};
     const VkPipelineStageFlags waitStages[2] = {
             timed ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT};
@@ -2269,7 +2349,8 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     timelineInfo.pWaitSemaphoreValues = waitValues;
 
     VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.pNext = waitDecode ? &timelineInfo : nullptr;
+    // Binary semaphores have no timeline pNext. The Shield is Vulkan 1.1 without timeline semaphores.
+    submit.pNext = waitTimeline ? &timelineInfo : nullptr;
     submit.waitSemaphoreCount = waitDecode ? 2 : 1;
     submit.pWaitSemaphores = waitSemaphores;
     submit.pWaitDstStageMask = waitStages;
@@ -2285,6 +2366,9 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     }
     if (result != VK_SUCCESS) {
         ALOGE("vkQueueSubmit failed: %d", result);
+        if (blitSemaphore) {
+            pyrowave_->revertBlitSemaphore(frame->blitPhase);
+        }
         return false;
     }
     if (frontBufferAligned_ && frontBuffer_) {
@@ -2352,6 +2436,10 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
         result = vk_.vkQueuePresentKHR(queue_, &present);
+    }
+    if (frame->sharedBlit) {
+        // Present is queued (or has failed) before the next decode submit.
+        pyrowave_->finishSharedBlit(frame->readyValue, frame->blitPhase);
     }
     // The render's CPU time for the performance hint session, without waiting for the GPU or a
     // swapchain image
@@ -2482,34 +2570,36 @@ void VulkanRenderer::collectPresentTimings() {
     }
 }
 
-void VulkanRenderer::noteReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t enqueueNs, int64_t hostProcessingNs) {
-    // Called as the frame goes to the decoder, so the time on our clock is when decoding starts
-    const int64_t queuedNs = nowNs();
-    const int64_t commonToLocalNs = queuedNs - static_cast<int64_t>(LiGetMicroseconds()) * 1000;
-
-    // Where its capture latency counts from. A frame the host gave no processing time for repeats
-    // an earlier one, so it has no capture of its own.
-    if (hostProcessingNs != 0) {
-        FrameOrigin origin {0, false};
-        uint64_t captureUs = 0;
-        if (LiGetHostTimeOnLocalClock(static_cast<uint64_t>(hostPtsNs / 1000), &captureUs)) {
-            origin = {static_cast<int64_t>(captureUs) * 1000 + commonToLocalNs, true};
-        }
-        else if (receiveNs != 0) {
-            // Without clock sync, nothing measures the network transit per frame, so it's left out.
-            // The host's part is on its clock and the rest on ours, so they add without the clocks
-            // needing to agree.
-            origin = {receiveNs + commonToLocalNs - hostProcessingNs, false};
-        }
-        if (origin.ns != 0) {
-            std::lock_guard<std::mutex> lock(latencyMutex_);
-            origins_[hostPtsNs] = origin;
-            while (origins_.size() > 64) {
-                origins_.erase(origins_.begin());
-            }
-        }
+VulkanRenderer::FrameOrigin VulkanRenderer::frameOrigin(int64_t hostPtsNs, int64_t receiveNs, int64_t hostProcessingNs,
+                                                         int64_t* queuedNs, int64_t* commonToLocalNs) {
+    const int64_t now = nowNs();
+    const int64_t common = now - static_cast<int64_t>(LiGetMicroseconds()) * 1000;
+    if (queuedNs) {
+        *queuedNs = now;
     }
+    if (commonToLocalNs) {
+        *commonToLocalNs = common;
+    }
+    // A frame the host gave no processing time for repeats an earlier one, so it has no capture.
+    FrameOrigin origin {0, false};
+    if (hostProcessingNs == 0) {
+        return origin;
+    }
+    uint64_t captureUs = 0;
+    if (LiGetHostTimeOnLocalClock(static_cast<uint64_t>(hostPtsNs / 1000), &captureUs)) {
+        origin = {static_cast<int64_t>(captureUs) * 1000 + common, true};
+    }
+    else if (receiveNs != 0) {
+        // Without clock sync, nothing measures the network transit per frame, so it's left out.
+        // The host's part is on its clock and the rest on ours, so they add without the clocks
+        // needing to agree.
+        origin = {receiveNs + common - hostProcessingNs, false};
+    }
+    return origin;
+}
 
+void VulkanRenderer::traceReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t enqueueNs, int64_t queuedNs,
+                                   int64_t commonToLocalNs, int64_t hostProcessingNs) {
     if (!traceRecording_.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2521,18 +2611,68 @@ void VulkanRenderer::noteReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t 
     trace_.received(hostPtsNs, receiveNs, enqueueNs, queuedNs, commonToLocalNs, hostProcessingNs, rttMs);
 }
 
-void VulkanRenderer::noteDecoded(VideoFrame& frame) {
-    std::lock_guard<std::mutex> lock(latencyMutex_);
-    auto it = origins_.find(frame.timing.hostPtsNs);
-    if (it == origins_.end()) {
+void VulkanRenderer::noteReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t enqueueNs, int64_t hostProcessingNs) {
+    // The Java path calls this before the VideoFrame exists, so the origin waits in the map.
+    int64_t queuedNs = 0;
+    int64_t commonToLocalNs = 0;
+    const FrameOrigin origin = frameOrigin(hostPtsNs, receiveNs, hostProcessingNs, &queuedNs, &commonToLocalNs);
+    if (origin.ns != 0) {
+        std::lock_guard<std::mutex> lock(latencyMutex_);
+        origins_[hostPtsNs] = origin;
+        while (origins_.size() > 64) {
+            origins_.erase(origins_.begin());
+        }
+    }
+    traceReceived(hostPtsNs, receiveNs, enqueueNs, queuedNs, commonToLocalNs, hostProcessingNs);
+}
+
+void VulkanRenderer::noteDecoded(VideoFrame& frame, int64_t decodedAtNs, bool count) {
+    if (frame.originNs == 0) {
+        std::lock_guard<std::mutex> lock(latencyMutex_);
+        auto it = origins_.find(frame.timing.hostPtsNs);
+        if (it == origins_.end()) {
+            return;
+        }
+        frame.originNs = it->second.ns;
+        frame.originSynced = it->second.synced;
+        // Frames are decoded in order, so any still waiting before this one never will be
+        origins_.erase(origins_.begin(), std::next(it));
+        if (count) {
+            countLatency(captureLatency_.decoded, decodedAtNs - frame.originNs, frame.originSynced);
+        }
         return;
     }
-    frame.originNs = it->second.ns;
-    frame.originSynced = it->second.synced;
+    if (!count) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(latencyMutex_);
+    countLatency(captureLatency_.decoded, decodedAtNs - frame.originNs, frame.originSynced);
+}
 
-    // Frames are decoded in order, so any still waiting before this one never will be
-    origins_.erase(origins_.begin(), std::next(it));
-    countLatency(captureLatency_.decoded, frame.timing.arrivalNs - frame.originNs, frame.originSynced);
+void VulkanRenderer::beforeDecodeSubmitThunk(void* userdata) {
+    static_cast<VulkanRenderer*>(userdata)->beforeDecodeSubmit();
+}
+
+void VulkanRenderer::decodeSubmitDroppedThunk(void* userdata) {
+    static_cast<VulkanRenderer*>(userdata)->finishOutstandingDecode();
+}
+
+void VulkanRenderer::beforeDecodeSubmit() {
+    std::lock_guard<std::mutex> lock(decodingMutex_);
+    outstandingDecodes_++;
+    if (keepBusyGroups_ != 0) {
+        keepBusy_.pause();
+    }
+}
+
+void VulkanRenderer::finishOutstandingDecode() {
+    std::lock_guard<std::mutex> lock(decodingMutex_);
+    if (outstandingDecodes_ > 0) {
+        outstandingDecodes_--;
+    }
+    if (outstandingDecodes_ == 0 && decoding_.empty() && keepBusyGroups_ != 0) {
+        keepBusy_.resume();
+    }
 }
 
 // Under latencyMutex_. Outside a second, the clock sync or the frame's timing must be wrong.
