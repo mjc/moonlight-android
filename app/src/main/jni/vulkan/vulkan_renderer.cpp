@@ -2232,15 +2232,18 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     else if (config_.ditherMode == 2) {
         ditherAmplitude = 1.0f / 255.0f;
     }
-    float contentPeakNits;
-    {
+    const bool toneMapHdr = hdrActive_ && !outputPq_;
+    float toneMapWhiteRatio = 1.0f;
+    if (toneMapHdr) {
+        float contentPeakNits;
         std::lock_guard<std::mutex> lock(mutex_);
         contentPeakNits = hdrMetadata_.contentPeakNits;
+        toneMapWhiteRatio = std::max(contentPeakNits / kSdrWhiteNits, 1.0f);
     }
     pc.params[0] = ditherAmplitude;
     pc.params[1] = 5.588238f * static_cast<float>(frameCounter_ % 64);
-    pc.params[2] = (hdrActive_ && !outputPq_) ? kOutputPqToSdr : kOutputPassthrough;
-    pc.params[3] = std::max(contentPeakNits / kSdrWhiteNits, 1.0f);
+    pc.params[2] = toneMapHdr ? kOutputPqToSdr : kOutputPassthrough;
+    pc.params[3] = toneMapWhiteRatio;
     pc.params2[0] = kPqToSdrScale;
     pc.params2[1] = static_cast<float>(std::max(quarterTurns(preTransform_), 0));
     if (planar) {
