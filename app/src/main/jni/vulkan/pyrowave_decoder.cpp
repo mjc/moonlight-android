@@ -468,6 +468,23 @@ PyrowaveDecoder::~PyrowaveDecoder() {
     if (sampler_) renderVk().vkDestroySampler(renderDevice(), sampler_, nullptr);
 }
 
+namespace {
+
+// Drops the highest slots until kept capacity fits in one frame. The first `keep` slots stay.
+// A push passes keep past the slot it is about to hand out, and earlier pushes still hold theirs.
+void trimSpanCopies(std::deque<std::vector<uint8_t>>& copies, size_t keep) {
+    size_t spanCapacity = 0;
+    for (const std::vector<uint8_t>& copy : copies) {
+        spanCapacity += copy.capacity();
+    }
+    while (spanCapacity > kMaxPyrowaveFrameBytes && copies.size() > keep) {
+        spanCapacity -= copies.back().capacity();
+        copies.pop_back();
+    }
+}
+
+}  // namespace
+
 PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount,
                                         const std::vector<size_t>* recordStarts, Partial partial,
                                         uint64_t* readyValue, DecodeTimes* times) {
@@ -476,17 +493,9 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     queueHeldNs_ = 0;
     queueHolds_ = 0;
     spanCopyUsed_ = 0;
-    // The previous frame's pointers died when its decode_gpu_buffer returned. Slots keep
-    // the largest run they have held, so the total can pass one frame. Drop the highest
-    // until it fits; the low slots are the runs that come first.
-    size_t spanCapacity = 0;
-    for (const std::vector<uint8_t>& copy : spanCopies_) {
-        spanCapacity += copy.capacity();
-    }
-    while (spanCapacity > kMaxPyrowaveFrameBytes && !spanCopies_.empty()) {
-        spanCapacity -= spanCopies_.back().capacity();
-        spanCopies_.pop_back();
-    }
+    // The previous frame's pointers are dead. A slot that geometric growth left over one
+    // frame is dropped here, before this frame pushes.
+    trimSpanCopies(spanCopies_, 0);
     signaledBlit_ = false;
     *times = {};
 
@@ -832,20 +841,26 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (length > kMaxPyrowaveFrameBytes) {
         return false;
     }
-    // Reuse the buffer from the last frame that crossed in this slot. A new vector
-    // zero-fills; a later frame of the same size does not.
+    // Same length reuses the slot. A shorter or longer run replaces it with a buffer of
+    // that length. resize would double a buffer that is too small, and the old capacity
+    // would count until the next decode. Higher slots are not in use yet.
     if (spanCopyUsed_ >= spanCopies_.size()) {
         spanCopies_.emplace_back();
     }
-    std::vector<uint8_t>& copy = spanCopies_[spanCopyUsed_];
-    if (copy.size() < length) {
-        copy.resize(length);
+    if (spanCopies_[spanCopyUsed_].capacity() != length) {
+        std::vector<uint8_t> exact(length);
+        spanCopies_[spanCopyUsed_].swap(exact);
     }
-    if (!frame.at(offset, length, copy.data())) {
+    else if (spanCopies_[spanCopyUsed_].size() != length) {
+        spanCopies_[spanCopyUsed_].resize(length);
+    }
+    trimSpanCopies(spanCopies_, spanCopyUsed_ + 1);
+    uint8_t* copy = spanCopies_[spanCopyUsed_].data();
+    if (!frame.at(offset, length, copy)) {
         return false;
     }
     spanCopyUsed_++;
-    return api.decoderPushPacket(decoder_, copy.data(), length) == PYROWAVE_SUCCESS;
+    return api.decoderPushPacket(decoder_, copy, length) == PYROWAVE_SUCCESS;
 }
 
 bool PyrowaveDecoder::waitPreviousBlit() {
