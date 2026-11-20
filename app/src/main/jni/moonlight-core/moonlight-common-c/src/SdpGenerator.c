@@ -293,6 +293,26 @@ static int pyrowavePictureBitrateKbps(int width, int height, int fps, int tenBit
     }
 }
 
+// Kbps that keeps two PyroWave frames inside the socket the OS will actually
+// give us. A frame arrives as one burst, and the next burst can start before
+// that one has been read. Zero means the probe failed and the picture budget
+// stands.
+static int pyrowaveSocketBitrateKbps(int payloadBytes, int fps) {
+    int frameBytes;
+
+    if (payloadBytes <= 0) {
+        return 0;
+    }
+    if (fps < 1) {
+        fps = 60;
+    }
+    frameBytes = payloadBytes / 2;
+    if (frameBytes < 1) {
+        return 0;
+    }
+    return (int)((long long)frameBytes * 8 * fps / 1000);
+}
+
 static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     PSDP_OPTION optionHead;
     char payloadStr[92];
@@ -379,7 +399,7 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
         // A slider set for H.264 or HEVC, the 20% FEC reserve, and GFE's 100 Mbps
         // cap all leave PyroWave without its high-frequency bands. That is a soft
-        // picture. A higher slider is kept.
+        // picture. A higher slider is kept, unless the socket cannot hold the burst.
         int pictureBitrate = pyrowavePictureBitrateKbps(StreamConfig.width, StreamConfig.height,
                                                         StreamConfig.fps,
                                                         (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_10BIT) != 0);
@@ -387,6 +407,15 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             Limelog("Raising PyroWave bitrate from %d Kbps to %d Kbps for %dx%d at %d fps",
                     requestedBitrate, pictureBitrate, StreamConfig.width, StreamConfig.height, StreamConfig.fps);
             requestedBitrate = pictureBitrate;
+        }
+        {
+            int payloadBytes = udpReceivePayloadBytes();
+            int socketBitrate = pyrowaveSocketBitrateKbps(payloadBytes, StreamConfig.fps);
+            if (socketBitrate > 0 && requestedBitrate > socketBitrate) {
+                Limelog("Capping PyroWave bitrate from %d Kbps to %d Kbps to fit a %d byte receive buffer",
+                        requestedBitrate, socketBitrate, payloadBytes);
+                requestedBitrate = socketBitrate;
+            }
         }
         adjustedBitrate = requestedBitrate;
     }

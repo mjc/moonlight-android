@@ -126,6 +126,9 @@ int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKA
                                 struct sockaddr_storage* localAddr, SOCKADDR_LEN* localAddrLen);
 int sendMtuSafe(SOCKET s, char* buffer, int size);
 SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCKADDR_LEN addrLen, int bufferSize, int socketQosType);
+// UDP payload bytes SO_RCVBUF will actually queue. The system cap can be lower
+// than the size the caller asks for.
+int udpReceivePayloadBytes(void);
 int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);

@@ -288,6 +288,34 @@ static void setSocketQos(SOCKET s, int socketQosType) {
 #endif
 }
 
+int udpReceivePayloadBytes(void) {
+    int request = 8 * 1024 * 1024;
+    int actual = 0;
+    SOCKADDR_LEN len = sizeof(actual);
+    SOCKET s = createSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP, false);
+
+    if (s == INVALID_SOCKET) {
+        return 0;
+    }
+    if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&request, sizeof(request)) != 0) {
+        closeSocket(s);
+        return 0;
+    }
+    if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&actual, &len) != 0 || actual <= 0) {
+        closeSocket(s);
+        return 0;
+    }
+    closeSocket(s);
+
+    // Linux returns twice the value it accepted. The extra half is skb overhead,
+    // so the queued payload is the accepted value.
+#if defined(__linux__)
+    return actual / 2;
+#else
+    return actual;
+#endif
+}
+
 SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCKADDR_LEN addrLen, int bufferSize, int socketQosType) {
     SOCKET s;
     LC_SOCKADDR bindAddr;
