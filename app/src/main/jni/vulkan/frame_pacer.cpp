@@ -84,6 +84,10 @@ void FramePacer::setVsyncPeriod(int64_t periodNs) {
     if (periodNs > 0 && std::llabs(periodNs - periodNs_) * 50 > periodNs_) {
         periodNs_ = periodNs;
         vsyncs_.clear();
+        vsyncSumIndex_ = 0;
+        vsyncSumTime_ = 0;
+        vsyncSumIndexSquared_ = 0;
+        vsyncSumIndexTime_ = 0;
         anchored_ = false;
     }
 }
@@ -95,31 +99,45 @@ void FramePacer::trackVsync(int64_t vsyncNs) {
     }
     lastVsyncNs_ = vsyncNs;
 
-    vsyncs_.push_back({vsyncIndex_, vsyncNs});
+    const VsyncSample sample {vsyncIndex_, vsyncNs};
+    if (!vsyncs_.empty()) {
+        const VsyncSample& origin = vsyncs_.front();
+        const double x = static_cast<double>(sample.index - origin.index);
+        const double y = static_cast<double>(sample.timeNs - origin.timeNs);
+        vsyncSumIndex_ += x;
+        vsyncSumTime_ += y;
+        vsyncSumIndexSquared_ += x * x;
+        vsyncSumIndexTime_ += x * y;
+    }
+    vsyncs_.push_back(sample);
     if (vsyncs_.size() > kVsyncWindow) {
+        const VsyncSample oldOrigin = vsyncs_.front();
         vsyncs_.pop_front();
+        const VsyncSample& newOrigin = vsyncs_.front();
+        const double dx = static_cast<double>(newOrigin.index - oldOrigin.index);
+        const double dy = static_cast<double>(newOrigin.timeNs - oldOrigin.timeNs);
+        const double n = static_cast<double>(vsyncs_.size());
+        const double oldSumIndex = vsyncSumIndex_;
+        const double oldSumTime = vsyncSumTime_;
+        // Keep the regression sums relative to the oldest sample. Translate them when the
+        // window moves instead of rescanning all its samples.
+        vsyncSumIndexSquared_ += -2 * dx * oldSumIndex + n * dx * dx;
+        vsyncSumIndexTime_ += -dx * oldSumTime - dy * oldSumIndex + n * dx * dy;
+        vsyncSumIndex_ = oldSumIndex - n * dx;
+        vsyncSumTime_ = oldSumTime - n * dy;
     }
     if (vsyncs_.size() < kMinVsyncsForPeriod) {
         return;
     }
 
     // Least squares fit of vsync time against vsync index
-    const VsyncSample& first = vsyncs_.front();
-    double sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (const VsyncSample& v : vsyncs_) {
-        const double x = static_cast<double>(v.index - first.index);
-        const double y = static_cast<double>(v.timeNs - first.timeNs);
-        sx += x;
-        sy += y;
-        sxx += x * x;
-        sxy += x * y;
-    }
     const double n = static_cast<double>(vsyncs_.size());
-    const double denominator = n * sxx - sx * sx;
+    const double denominator = n * vsyncSumIndexSquared_ - vsyncSumIndex_ * vsyncSumIndex_;
     if (denominator <= 0) {
         return;
     }
-    const int64_t measured = static_cast<int64_t>(std::llround((n * sxy - sx * sy) / denominator));
+    const int64_t measured = static_cast<int64_t>(
+            std::llround((n * vsyncSumIndexTime_ - vsyncSumIndex_ * vsyncSumTime_) / denominator));
     if (std::llabs(measured - periodNs_) * 10 < periodNs_) {
         periodNs_ = measured;
     }

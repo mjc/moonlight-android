@@ -211,6 +211,10 @@ private:
         int64_t timeNs;
     };
     std::deque<VsyncSample> vsyncs_;
+    double vsyncSumIndex_ = 0;
+    double vsyncSumTime_ = 0;
+    double vsyncSumIndexSquared_ = 0;
+    double vsyncSumIndexTime_ = 0;
 
     int64_t lastVsyncNs_ = 0;
     int64_t vsyncIndex_ = 0;  // Vsyncs seen, counting ones whose callbacks we missed
