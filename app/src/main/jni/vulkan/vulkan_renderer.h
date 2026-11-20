@@ -455,8 +455,10 @@ private:
     std::deque<FramePtr> decoding_;
     bool decodingQuit_ = false;
     // Decodes whose vkQueueSubmit has paused GpuKeepBusy and whose fence wait has not returned.
-    // The pause clears only when this is zero and decoding_ is empty.
+    // The pause also stays while a frame is accepted and not yet submitted (decodeRecording_).
+    // It clears only when both are clear and decoding_ is empty.
     int outstandingDecodes_ = 0;
+    bool decodeRecording_ = false;
     bool pyrowaveSharesQueue_ = false;
 
     // Per frame in flight
@@ -648,13 +650,21 @@ private:
     void traceReceived(int64_t hostPtsNs, int64_t receiveNs, int64_t enqueueNs, int64_t queuedNs,
                        int64_t commonToLocalNs, int64_t hostProcessingNs);
     void countLatency(LatencySpan& span, int64_t latencyNs, bool synced);
-    // Pause keep-busy around a decode submit. beforeDecodeSubmit runs after the shared-queue
-    // blit wait and before vkQueueSubmit, and it returns only once the chunks already on the
-    // GPU have finished. finishOutstandingDecode runs once that submit's fence wait has
-    // returned, or the submit failed, or the frame was not queued. New chunks then wait while a
-    // shared-queue frame is still queued without a draw fence, and until that fence has signaled.
+    // Pause keep-busy around a decode submit. noteDecodeRecord runs once the frame is
+    // accepted, so chunks already on the GPU drain during the slot wait, the blit wait,
+    // and command recording.
+    // beforeDecodeSubmit runs after the shared-queue blit wait and before vkQueueSubmit,
+    // and it returns only once those chunks have finished. finishOutstandingDecode runs
+    // once that submit's fence wait has returned, or the submit failed, or the frame was
+    // not queued. abandonDecodeRecord runs when the frame is dropped before the submit.
+    // New chunks then wait while a shared-queue frame is still queued without a draw fence,
+    // and until that fence has signaled.
+    void noteDecodeRecord();
+    void abandonDecodeRecord();
     void beforeDecodeSubmit();
     void finishOutstandingDecode();
+    static void noteDecodeRecordThunk(void* userdata);
+    static void abandonDecodeRecordThunk(void* userdata);
     static void beforeDecodeSubmitThunk(void* userdata);
     static void decodeSubmitDroppedThunk(void* userdata);
     std::mutex latencyMutex_;

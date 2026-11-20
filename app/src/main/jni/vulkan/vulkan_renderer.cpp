@@ -1,6 +1,7 @@
 #include "vulkan_renderer.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
@@ -971,6 +972,8 @@ bool VulkanRenderer::createPyrowaveDecoder() {
     }
     pyrowaveSharesQueue_ = !decodeQueue_ && !decodeDevice_;
     info.shareRenderQueue = pyrowaveSharesQueue_;
+    info.beforeDecodeRecord = &VulkanRenderer::noteDecodeRecordThunk;
+    info.decodeRecordAbandoned = &VulkanRenderer::abandonDecodeRecordThunk;
     info.beforeDecodeSubmit = &VulkanRenderer::beforeDecodeSubmitThunk;
     info.decodeSubmitDropped = &VulkanRenderer::decodeSubmitDroppedThunk;
     info.submitUserdata = this;
@@ -1774,10 +1777,13 @@ int64_t VulkanRenderer::alignedRenderCostNs() const {
 }
 
 int64_t VulkanRenderer::percentile90(const std::deque<int64_t>& samples) {
-    std::vector<int64_t> sorted(samples.begin(), samples.end());
-    const auto p90 = sorted.begin() + (sorted.size() - 1) * 9 / 10;
-    std::nth_element(sorted.begin(), p90, sorted.end());
-    return *p90;
+    // drawSubmitNs_ and drawGpuNs_ are capped at kAlignedLeadSamples.
+    const size_t count = samples.size();
+    std::array<int64_t, kAlignedLeadSamples> sorted;
+    std::copy_n(samples.begin(), count, sorted.begin());
+    const size_t index = (count - 1) * 9 / 10;
+    std::nth_element(sorted.begin(), sorted.begin() + index, sorted.begin() + count);
+    return sorted[index];
 }
 
 void VulkanRenderer::traceAlignedLead() {
@@ -1849,11 +1855,12 @@ void VulkanRenderer::presentNewest(int64_t targetVsyncNs) {
 }
 
 void VulkanRenderer::trackVsyncPeriod(int64_t frameTimeNanos) {
+    constexpr size_t kVsyncDeltaSamples = 60;
     // Refined even with the refresh rate callback, which only reports changes
     if (lastVsyncNs_ != 0) {
         const int64_t delta = frameTimeNanos - lastVsyncNs_;
         vsyncDeltas_.push_back(delta);
-        if (vsyncDeltas_.size() > 60) {
+        if (vsyncDeltas_.size() > kVsyncDeltaSamples) {
             vsyncDeltas_.pop_front();
         }
 
@@ -1864,13 +1871,15 @@ void VulkanRenderer::trackVsyncPeriod(int64_t frameTimeNanos) {
             trace_.period(refined);
             pacer_.setVsyncPeriod(refined);
         }
-        else if (!refreshRateCallbackRegistered_ && vsyncDeltas_.size() == 60) {
+        else if (!refreshRateCallbackRegistered_ && vsyncDeltas_.size() == kVsyncDeltaSamples) {
             // Without the refresh rate callback, the refresh rate changed if most recent
             // intervals are far off. A single short one isn't enough: callbacks bunch up after
             // a late one, and taking that for a new refresh rate threw the pacer off.
-            std::vector<int64_t> sorted(vsyncDeltas_.begin(), vsyncDeltas_.end());
-            std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
-            const int64_t median = sorted[sorted.size() / 2];
+            std::array<int64_t, kVsyncDeltaSamples> sorted;
+            std::copy_n(vsyncDeltas_.begin(), kVsyncDeltaSamples, sorted.begin());
+            const size_t mid = kVsyncDeltaSamples / 2;
+            std::nth_element(sorted.begin(), sorted.begin() + mid, sorted.end());
+            const int64_t median = sorted[mid];
             if (median < period * 3 / 4 || median > period * 5 / 4) {
                 ALOGI("Vsync period changed to %" PRId64 " ns", median);
                 trace_.period(median);
@@ -2687,6 +2696,14 @@ void VulkanRenderer::noteDecoded(VideoFrame& frame, int64_t decodedAtNs, bool co
     countLatency(captureLatency_.decoded, decodedAtNs - frame.originNs, frame.originSynced);
 }
 
+void VulkanRenderer::noteDecodeRecordThunk(void* userdata) {
+    static_cast<VulkanRenderer*>(userdata)->noteDecodeRecord();
+}
+
+void VulkanRenderer::abandonDecodeRecordThunk(void* userdata) {
+    static_cast<VulkanRenderer*>(userdata)->abandonDecodeRecord();
+}
+
 void VulkanRenderer::beforeDecodeSubmitThunk(void* userdata) {
     static_cast<VulkanRenderer*>(userdata)->beforeDecodeSubmit();
 }
@@ -2695,8 +2712,25 @@ void VulkanRenderer::decodeSubmitDroppedThunk(void* userdata) {
     static_cast<VulkanRenderer*>(userdata)->finishOutstandingDecode();
 }
 
+void VulkanRenderer::noteDecodeRecord() {
+    std::lock_guard<std::mutex> lock(decodingMutex_);
+    decodeRecording_ = true;
+    if (keepBusyGroups_ != 0) {
+        keepBusy_.requestPause();
+    }
+}
+
+void VulkanRenderer::abandonDecodeRecord() {
+    std::lock_guard<std::mutex> lock(decodingMutex_);
+    decodeRecording_ = false;
+    if (outstandingDecodes_ == 0 && decoding_.empty() && keepBusyGroups_ != 0) {
+        keepBusy_.resume();
+    }
+}
+
 void VulkanRenderer::beforeDecodeSubmit() {
     std::lock_guard<std::mutex> lock(decodingMutex_);
+    decodeRecording_ = false;
     outstandingDecodes_++;
     if (keepBusyGroups_ != 0) {
         keepBusy_.pause();
@@ -2708,7 +2742,7 @@ void VulkanRenderer::finishOutstandingDecode() {
     if (outstandingDecodes_ > 0) {
         outstandingDecodes_--;
     }
-    if (outstandingDecodes_ == 0 && decoding_.empty() && keepBusyGroups_ != 0) {
+    if (outstandingDecodes_ == 0 && !decodeRecording_ && decoding_.empty() && keepBusyGroups_ != 0) {
         keepBusy_.resume();
     }
 }

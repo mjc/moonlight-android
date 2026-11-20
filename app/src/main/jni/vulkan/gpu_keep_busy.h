@@ -40,6 +40,8 @@ public:
                const char* globalPriorityExt, int64_t chunkNs, uint32_t groups);
     // Waits for the work in flight, then frees everything. Safe to call more than once.
     void stop();
+    // Submits nothing more until resume(). Does not wait for chunks already on the GPU.
+    void requestPause();
     // Finishes every chunk already submitted. Submits nothing until resume().
     void pause();
     void resume();

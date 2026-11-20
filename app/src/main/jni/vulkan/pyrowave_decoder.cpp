@@ -572,6 +572,24 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
 
     times->pushNs = nowNs() - startNs;
 
+    // Chunks already keeping the GPU busy drain while the command buffer is recorded.
+    // Dropped before the submit: the hold ends here. Once beforeDecodeSubmit runs, that
+    // path owns the pause, including when the submit itself fails.
+    struct BoostHold {
+        void (*abandoned)(void*);
+        void* userdata;
+        bool held = false;
+        ~BoostHold() {
+            if (held && abandoned != nullptr) {
+                abandoned(userdata);
+            }
+        }
+    } boost {info_.decodeRecordAbandoned, info_.submitUserdata};
+    if (info_.beforeDecodeRecord != nullptr) {
+        info_.beforeDecodeRecord(info_.submitUserdata);
+        boost.held = true;
+    }
+
     PyrowavePlanes* planes = acquirePlanes();
     if (!planes) {
         times->waitedNs = waitedNs_;
@@ -687,6 +705,7 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     if (info_.beforeDecodeSubmit) {
         info_.beforeDecodeSubmit(info_.submitUserdata);
     }
+    boost.held = false;
 
     // After the decode before it, which may have been into these planes. Only the stage that
     // writes them waits, as PyroWave's own submissions did, so the start of a decode (the

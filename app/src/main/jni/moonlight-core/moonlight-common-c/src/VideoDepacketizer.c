@@ -36,6 +36,39 @@ static unsigned int consecutiveFrameDrops;
 
 static LINKED_BLOCKING_QUEUE decodeUnitQueue;
 
+// The decode thread takes one unit per frame and returns it before the next, so a small
+// pool covers the steady state. The queue holds at most 15, plus the one being completed.
+#define QDU_POOL_MAX 16
+static PQUEUED_DECODE_UNIT qduPool[QDU_POOL_MAX];
+static int qduPoolCount;
+static pthread_mutex_t qduPoolMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void destroyQueuedDecodeUnitPool(void) {
+    pthread_mutex_lock(&qduPoolMutex);
+    while (qduPoolCount > 0) {
+        free(qduPool[--qduPoolCount]);
+    }
+    pthread_mutex_unlock(&qduPoolMutex);
+}
+
+static PQUEUED_DECODE_UNIT allocQueuedDecodeUnit(void) {
+    pthread_mutex_lock(&qduPoolMutex);
+    PQUEUED_DECODE_UNIT qdu = qduPoolCount > 0 ? qduPool[--qduPoolCount] : NULL;
+    pthread_mutex_unlock(&qduPoolMutex);
+    return qdu != NULL ? qdu : malloc(sizeof(QUEUED_DECODE_UNIT));
+}
+
+static void freeQueuedDecodeUnit(PQUEUED_DECODE_UNIT qdu) {
+    pthread_mutex_lock(&qduPoolMutex);
+    if (qduPoolCount < QDU_POOL_MAX) {
+        qduPool[qduPoolCount++] = qdu;
+        pthread_mutex_unlock(&qduPoolMutex);
+        return;
+    }
+    pthread_mutex_unlock(&qduPoolMutex);
+    free(qdu);
+}
+
 typedef struct _BUFFER_DESC {
     char* data;
     unsigned int offset;
@@ -64,6 +97,7 @@ typedef struct _LENTRY_INTERNAL {
 
 // Init
 void initializeVideoDepacketizer(int pktSize) {
+    destroyQueuedDecodeUnitPool();
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 
     nextFrameNumber = 1;
@@ -160,6 +194,7 @@ void stopVideoDepacketizer(void) {
 // Cleanup video depacketizer and free malloced memory
 void destroyVideoDepacketizer(void) {
     freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&decodeUnitQueue));
+    destroyQueuedDecodeUnitPool();
     cleanupFrameState();
 }
 
@@ -314,7 +349,7 @@ void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
 
     // We will have stack-allocated entries iff we have a direct-submit decoder
     if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-        free(qdu);
+        freeQueuedDecodeUnit(qdu);
     }
 }
 
@@ -483,7 +518,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
 
         // Use a stack allocation if we won't be queuing this
         if ((VideoCallbacks.capabilities & CAPABILITY_DIRECT_SUBMIT) == 0) {
-            qdu = (PQUEUED_DECODE_UNIT)malloc(sizeof(*qdu));
+            qdu = allocQueuedDecodeUnit();
         }
         else {
             qdu = &qduDS;
@@ -536,7 +571,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                     dropFrameState();
 
                     // Free the DU we were going to queue
-                    free(qdu);
+                    freeQueuedDecodeUnit(qdu);
 
                     // Free all frames in the decode unit queue
                     freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));

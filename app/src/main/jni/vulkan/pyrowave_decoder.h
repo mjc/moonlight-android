@@ -113,6 +113,11 @@ public:
         const VkApi* renderVk = nullptr;
         // Decode and the draw share `queue`. The draw of frame N is queued before decode N+1.
         bool shareRenderQueue = false;
+        // Once the frame is accepted, before its command buffer is recorded. Does not
+        // wait. Chunks already on the GPU then finish during that recording.
+        // decodeRecordAbandoned runs when the frame is dropped before beforeDecodeSubmit.
+        void (*beforeDecodeRecord)(void* userdata) = nullptr;
+        void (*decodeRecordAbandoned)(void* userdata) = nullptr;
         // Immediately before the decode vkQueueSubmit, after the N-2 wait, and not while
         // queueMutex is held. decodeSubmitDropped runs if that submit fails.
         void (*beforeDecodeSubmit)(void* userdata) = nullptr;

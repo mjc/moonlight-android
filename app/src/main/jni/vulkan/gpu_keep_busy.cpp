@@ -75,12 +75,22 @@ void GpuKeepBusy::stop() {
     destroy();
 }
 
+void GpuKeepBusy::requestPause() {
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    if (quit_) {
+        return;
+    }
+    paused_ = true;
+    pauseCv_.notify_all();
+}
+
 void GpuKeepBusy::pause() {
     std::unique_lock<std::mutex> lock(pauseMutex_);
     if (quit_) {
         return;
     }
     paused_ = true;
+    pauseCv_.notify_all();
     pauseCv_.wait(lock, [this] { return quit_.load() || inFlight_ == 0; });
 }
 

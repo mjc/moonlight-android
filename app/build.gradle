@@ -89,6 +89,11 @@ android {
             applicationIdSuffix ".debug"
             resValue "string", "app_label", "Moonlight (Debug)"
             resValue "string", "app_label_root", "Moonlight (Root Debug)"
+            // This is the package that streams. jniDebuggable passes NDK_DEBUG=1,
+            // which builds native code at -O0 and defines LC_DEBUG in moonlight-core.
+            // That macro runs Reed-Solomon over every complete frame that has FEC.
+            // Java debugging stays on.
+            jniDebuggable false
         }
         release {
             // To whomever is releasing/using an APK in release mode with

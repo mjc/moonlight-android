@@ -1,8 +1,8 @@
 #include "frame_pacer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <vector>
 
 namespace vkr {
 
@@ -174,9 +174,13 @@ void FramePacer::updateSlot(int64_t hostPtsNs) {
     if (ptsDeltas_.size() < kMinSlotDeltas) {
         return;
     }
-    std::vector<int64_t> sorted(ptsDeltas_.begin(), ptsDeltas_.end());
-    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
-    const int64_t median = sorted[sorted.size() / 2];
+    // ptsDeltas_ is capped at kSlotDeltaWindow, so this stays on the stack.
+    const size_t count = ptsDeltas_.size();
+    std::array<int64_t, kSlotDeltaWindow> sorted;
+    std::copy_n(ptsDeltas_.begin(), count, sorted.begin());
+    const size_t mid = count / 2;
+    std::nth_element(sorted.begin(), sorted.begin() + mid, sorted.begin() + count);
+    const int64_t median = sorted[mid];
     const int64_t vsyncs = (median + periodNs_ / 2) / periodNs_;
     if (vsyncs >= 1 && vsyncs <= 8 && std::llabs(median - vsyncs * periodNs_) * 100 <= periodNs_ * 15) {
         slotVsyncs_ = vsyncs;
@@ -385,9 +389,12 @@ bool FramePacer::partialDeadlineOffsetNs(const FrameTiming& frame, int64_t* offs
         return false;
     }
 
-    std::vector<int64_t> costs(readyCosts_.begin(), readyCosts_.end());
-    const auto percentile = costs.begin() + (costs.size() - 1) * kPartialReadyPercentile / 100;
-    std::nth_element(costs.begin(), percentile, costs.end());
+    // readyCosts_ is capped at kPartialReadySamples, so this stays on the stack.
+    const size_t count = readyCosts_.size();
+    std::array<int64_t, kPartialReadySamples> costs;
+    std::copy_n(readyCosts_.begin(), count, costs.begin());
+    const auto percentile = costs.begin() + (count - 1) * kPartialReadyPercentile / 100;
+    std::nth_element(costs.begin(), percentile, costs.begin() + count);
 
     // Ready the present guard before its vsync. The frames after this one are taken to have as
     // long after their host timestamps as this one does.
