@@ -2243,10 +2243,19 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     if (planar) {
         // PyroWave is always full range, in the colorspace we asked for, or BT.2020 for HDR
         const int colorspace = hdrActive_ ? 2 : config_.colorspace;
-        pc.ycbcr[0] = colorspace == 0 ? 0.299f : colorspace == 2 ? 0.2627f : 0.2126f;
-        pc.ycbcr[1] = colorspace == 0 ? 0.114f : colorspace == 2 ? 0.0593f : 0.0722f;
+        const float kr = colorspace == 0 ? 0.299f : colorspace == 2 ? 0.2627f : 0.2126f;
+        const float kb = colorspace == 0 ? 0.114f : colorspace == 2 ? 0.0593f : 0.0722f;
+        const float kg = 1.0f - kr - kb;
+        const float crScale = 2.0f * (1.0f - kr);
+        const float cbScale = 2.0f * (1.0f - kb);
+        // Fold the YCbCr matrix into constants so each fragment uses multiplies and adds,
+        // rather than recomputing the matrix coefficients and dividing for green.
+        pc.ycbcr[0] = crScale;
+        pc.ycbcr[1] = cbScale;
         // Gray chroma as the host's 8-bit UNORM target stores it; 16-bit is as good as 0.5
         pc.ycbcr[2] = pyrowave_->tenBit() ? 0.5f : 128.0f / 255.0f;
+        pc.params2[2] = kb * cbScale / kg;
+        pc.params2[3] = kr * crScale / kg;
         // This fork's Sunshine sites chroma with the left luma sample of each pair (MPEG-2
         // style); the nonary host sites it at the center of each 2x2 quad
         pc.ycbcr[3] = config_.pyrowaveCenterChroma ? 0.0f : 0.5f / bufferWidth;

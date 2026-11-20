@@ -6,8 +6,8 @@ layout(push_constant) uniform PushConstants {
     vec4 uvRect;
     vec4 uvClamp;
     vec4 params;   // x = dither amplitude, y = frame counter, z = output mode, w = content peak nits
-    vec4 params2;  // x = SDR reference white nits, y = quarter turns clockwise to pre-rotate by
-    vec4 ycbcr;    // Planar video: x = Kr, y = Kb, z = chroma midpoint, w = chroma U offset
+    vec4 params2;  // x = SDR reference white, y = quarter turns, z/w = planar green Cb/Cr coefficients
+    vec4 ycbcr;    // Planar video: x/y = red Cr and blue Cb scales, z = chroma midpoint, w = chroma U offset
 } pc;
 
 const float OUTPUT_PASSTHROUGH = 0.0;

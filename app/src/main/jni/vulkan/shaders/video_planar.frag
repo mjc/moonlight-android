@@ -18,10 +18,8 @@ void main() {
     float cb = texture(uPlanes[1], chromaUv).r - pc.ycbcr.z;
     float cr = texture(uPlanes[2], chromaUv).r - pc.ycbcr.z;
 
-    float kr = pc.ycbcr.x;
-    float kb = pc.ycbcr.y;
-    float r = y + 2.0 * (1.0 - kr) * cr;
-    float b = y + 2.0 * (1.0 - kb) * cb;
-    float g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    float r = y + pc.ycbcr.x * cr;
+    float b = y + pc.ycbcr.y * cb;
+    float g = y - pc.params2.z * cb - pc.params2.w * cr;
     outColor = outputColor(vec3(r, g, b));
 }
