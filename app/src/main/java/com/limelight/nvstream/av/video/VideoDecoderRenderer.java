@@ -12,7 +12,12 @@ public abstract class VideoDecoderRenderer {
     public abstract int submitDecodeUnit(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
                                          int frameNumber, int frameType, char frameHostProcessingLatency,
                                          long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs);
-    
+
+    // PyroWave frames submitted by the native renderer. The default records nothing.
+    public void accountNativePyrowaveFrame(int frameNumber, int frameType, char frameHostProcessingLatency,
+                                           long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
+    }
+
     public abstract void cleanup();
 
     public abstract int getCapabilities();

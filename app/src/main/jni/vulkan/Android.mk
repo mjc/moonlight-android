@@ -18,7 +18,7 @@ LOCAL_SRC_FILES := \
     vulkan_bridge.cpp \
     vulkan_renderer.cpp \
 
-LOCAL_C_INCLUDES := $(LOCAL_PATH) $(LOCAL_PATH)/../moonlight-core/moonlight-common-c/src
+LOCAL_C_INCLUDES := $(LOCAL_PATH) $(LOCAL_PATH)/../moonlight-core $(LOCAL_PATH)/../moonlight-core/moonlight-common-c/src
 LOCAL_CPPFLAGS += -std=c++17 -Wall
 
 # For LiSetPartialFrameDeadline(), which tells moonlight-common-c when to cut short PyroWave frames

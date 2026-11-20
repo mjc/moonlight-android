@@ -1424,16 +1424,17 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
-    @SuppressWarnings("deprecation")
     @Override
-    public int submitDecodeUnit(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
-                                int frameNumber, int frameType, char frameHostProcessingLatency,
-                                long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
+    public void accountNativePyrowaveFrame(int frameNumber, int frameType, char frameHostProcessingLatency,
+                                           long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
         if (stopping) {
-            // Don't bother if we're stopping
-            return MoonBridge.DR_OK;
+            return;
         }
+        accountIncomingFrame(frameNumber, frameType);
+        submitPyrowaveFrame(null, 0, frameHostProcessingLatency, receiveTimeUs, enqueueTimeUs, presentationTimeUs, false);
+    }
 
+    private void accountIncomingFrame(int frameNumber, int frameType) {
         if (lastFrameNumber == 0) {
             activeWindowVideoStats.measurementStartTimestamp = SystemClock.uptimeMillis();
         } else if (frameNumber != lastFrameNumber && frameNumber != lastFrameNumber + 1) {
@@ -1505,10 +1506,23 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             activeWindowVideoStats.clear();
             activeWindowVideoStats.measurementStartTimestamp = SystemClock.uptimeMillis();
         }
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public int submitDecodeUnit(byte[] decodeUnitData, int decodeUnitLength, int decodeUnitType,
+                                int frameNumber, int frameType, char frameHostProcessingLatency,
+                                long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
+        if (stopping) {
+            // Don't bother if we're stopping
+            return MoonBridge.DR_OK;
+        }
+
+        accountIncomingFrame(frameNumber, frameType);
 
         if (pyrowave) {
             return submitPyrowaveFrame(decodeUnitData, decodeUnitLength, frameHostProcessingLatency,
-                    receiveTimeUs, enqueueTimeUs, presentationTimeUs);
+                    receiveTimeUs, enqueueTimeUs, presentationTimeUs, true);
         }
 
         boolean csdSubmittedForThisFrame = false;
@@ -1852,11 +1866,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             capabilities |= MoonBridge.CAPABILITY_DIRECT_SUBMIT;
         }
 
+        // Lost PyroWave packets are delivered as BUFFER_TYPE_MISSING entries. The native
+        // submit reads those. It is registered when a PyroWave renderer is created, which
+        // happens before any frame, and direct submit stays off so that work stays off
+        // the receive thread.
+        if (prefs.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE
+                || prefs.videoFormat == PreferenceConfiguration.FormatOption.PREFER_PYROWAVE) {
+            capabilities |= MoonBridge.CAPABILITY_PARTIAL_FRAMES;
+        }
+
         return capabilities;
     }
 
     private int submitPyrowaveFrame(byte[] decodeUnitData, int decodeUnitLength, char frameHostProcessingLatency,
-                                    long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
+                                    long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs, boolean deliver) {
         if (frameHostProcessingLatency != 0) {
             if (activeWindowVideoStats.minHostProcessingLatency != 0) {
                 activeWindowVideoStats.minHostProcessingLatency = (char) Math.min(activeWindowVideoStats.minHostProcessingLatency, frameHostProcessingLatency);
@@ -1874,8 +1897,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
         numFramesIn++;
 
+        // The native submit already decoded this frame. These stats are the Java side of that path.
+        if (!deliver) {
+            return MoonBridge.DR_OK;
+        }
+
         VulkanRendererBridge vulkan = vulkanRenderer;
-        if (vulkan == null) {
+        if (vulkan == null || decodeUnitData == null) {
             return MoonBridge.DR_OK;
         }
         vulkan.noteFrameReceived(presentationTimeUs, receiveTimeUs, enqueueTimeUs, frameHostProcessingLatency);

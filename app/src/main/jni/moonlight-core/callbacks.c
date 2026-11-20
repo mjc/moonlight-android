@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <Limelight.h>
+#include "pyrowave_submit.h"
 
 #include <opus_multistream.h>
 #include <android/log.h>
@@ -22,6 +23,7 @@ static jmethodID BridgeDrStartMethod;
 static jmethodID BridgeDrStopMethod;
 static jmethodID BridgeDrCleanupMethod;
 static jmethodID BridgeDrSubmitDecodeUnitMethod;
+static jmethodID BridgeDrAccountPyrowaveFrameMethod;
 static jmethodID BridgeArInitMethod;
 static jmethodID BridgeArStartMethod;
 static jmethodID BridgeArStopMethod;
@@ -40,6 +42,53 @@ static jmethodID BridgeClSetMotionEventStateMethod;
 static jmethodID BridgeClSetControllerLEDMethod;
 static jbyteArray DecodedFrameBuffer;
 static jshortArray DecodedAudioBuffer;
+
+static PyrowaveFrameSubmitFn PyrowaveSubmitFn;
+static void* PyrowaveSubmitContext;
+static int PyrowaveSubmitInFlight;
+static pthread_mutex_t PyrowaveSubmitLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t PyrowaveSubmitCond = PTHREAD_COND_INITIALIZER;
+
+void LiSetPyrowaveFrameSubmit(PyrowaveFrameSubmitFn submit, void* context) {
+    pthread_mutex_lock(&PyrowaveSubmitLock);
+    if (submit == NULL) {
+        if (PyrowaveSubmitContext == context) {
+            PyrowaveSubmitFn = NULL;
+            PyrowaveSubmitContext = NULL;
+        }
+        while (PyrowaveSubmitInFlight > 0) {
+            pthread_cond_wait(&PyrowaveSubmitCond, &PyrowaveSubmitLock);
+        }
+    }
+    else {
+        PyrowaveSubmitFn = submit;
+        PyrowaveSubmitContext = context;
+    }
+    pthread_mutex_unlock(&PyrowaveSubmitLock);
+}
+
+static int beginPyrowaveSubmit(PyrowaveFrameSubmitFn* submit, void** context) {
+    pthread_mutex_lock(&PyrowaveSubmitLock);
+    if (PyrowaveSubmitFn == NULL) {
+        pthread_mutex_unlock(&PyrowaveSubmitLock);
+        return 0;
+    }
+
+    *submit = PyrowaveSubmitFn;
+    *context = PyrowaveSubmitContext;
+    PyrowaveSubmitInFlight++;
+    pthread_mutex_unlock(&PyrowaveSubmitLock);
+    return 1;
+}
+
+static void endPyrowaveSubmit(void) {
+    pthread_mutex_lock(&PyrowaveSubmitLock);
+    PyrowaveSubmitInFlight--;
+    if (PyrowaveSubmitInFlight == 0) {
+        pthread_cond_broadcast(&PyrowaveSubmitCond);
+    }
+    pthread_mutex_unlock(&PyrowaveSubmitLock);
+}
 
 void DetachThread(void* context) {
     (*JVM)->DetachCurrentThread(JVM);
@@ -86,6 +135,7 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
     BridgeDrStopMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrStop", "()V");
     BridgeDrCleanupMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrCleanup", "()V");
     BridgeDrSubmitDecodeUnitMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrSubmitDecodeUnit", "([BIIIICJJJ)I");
+    BridgeDrAccountPyrowaveFrameMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeDrAccountPyrowaveFrame", "(IICJJJ)V");
     BridgeArInitMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArInit", "(III)I");
     BridgeArStartMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArStart", "()V");
     BridgeArStopMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArStop", "()V");
@@ -146,6 +196,27 @@ void BridgeDrCleanup(void) {
 int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     JNIEnv* env = GetThreadEnv();
     int ret;
+    PyrowaveFrameSubmitFn submit;
+    void* submitContext;
+
+    // One copy into the renderer's storage. The Java path copies the frame into a byte
+    // array and then copies it back out.
+    if (beginPyrowaveSubmit(&submit, &submitContext)) {
+        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrAccountPyrowaveFrameMethod,
+                                      decodeUnit->frameNumber, decodeUnit->frameType,
+                                      (jchar)decodeUnit->frameHostProcessingLatency,
+                                      (jlong)decodeUnit->receiveTimeUs, (jlong)decodeUnit->enqueueTimeUs,
+                                      (jlong)decodeUnit->presentationTimeUs);
+        if ((*env)->ExceptionCheck(env)) {
+            endPyrowaveSubmit();
+            (*JVM)->DetachCurrentThread(JVM);
+            return DR_OK;
+        }
+
+        ret = submit(decodeUnit, submitContext);
+        endPyrowaveSubmit();
+        return ret;
+    }
 
     // Increase the size of our frame data buffer if our frame won't fit
     if ((*env)->GetArrayLength(env, DecodedFrameBuffer) < decodeUnit->fullLength) {
@@ -159,6 +230,14 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     currentEntry = decodeUnit->bufferList;
     offset = 0;
     while (currentEntry != NULL) {
+        // Missing stretches have a null pointer. Record starts are offsets in one PyroWave
+        // frame, not separate NALUs. The registered submit above is what decodes those.
+        if (currentEntry->bufferType == BUFFER_TYPE_MISSING
+                || currentEntry->bufferType == BUFFER_TYPE_RECORD_START
+                || currentEntry->data == NULL) {
+            return DR_OK;
+        }
+
         // Submit parameter set NALUs separately from picture data
         if (currentEntry->bufferType != BUFFER_TYPE_PICDATA) {
             // Use the beginning of the buffer each time since this is a separate

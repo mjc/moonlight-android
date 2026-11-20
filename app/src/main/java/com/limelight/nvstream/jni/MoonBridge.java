@@ -44,6 +44,7 @@ public class MoonBridge {
     public static final int CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC = 2;
     public static final int CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC = 4;
     public static final int CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 = 0x40;
+    public static final int CAPABILITY_PARTIAL_FRAMES = 0x80;
 
     public static final int DR_OK = 0;
     public static final int DR_NEED_IDR = -1;
@@ -230,6 +231,16 @@ public class MoonBridge {
         }
         else {
             return DR_OK;
+        }
+    }
+
+    // A PyroWave frame the native renderer already has. Stream stats only; the frame bytes
+    // stay on the native side.
+    public static void bridgeDrAccountPyrowaveFrame(int frameNumber, int frameType, char frameHostProcessingLatency,
+                                                    long receiveTimeUs, long enqueueTimeUs, long presentationTimeUs) {
+        if (videoRenderer != null) {
+            videoRenderer.accountNativePyrowaveFrame(frameNumber, frameType, frameHostProcessingLatency,
+                    receiveTimeUs, enqueueTimeUs, presentationTimeUs);
         }
     }
 

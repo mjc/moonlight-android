@@ -1,11 +1,91 @@
 #include <jni.h>
+#include <android/log.h>
 #include <android/native_window_jni.h>
+#include <cstring>
 #include <vector>
 
+#include "pyrowave_submit.h"
 #include "vulkan_renderer.h"
 
 using vkr::RendererConfig;
 using vkr::VulkanRenderer;
+
+namespace {
+
+constexpr int kMaxPyrowaveFrameBytes = 32 * 1024 * 1024;
+
+// Copies one PyroWave frame into a contiguous buffer. BUFFER_TYPE_MISSING entries are holes:
+// their data pointer is null and their length is the hole. RECORD_START entries are picture
+// bytes that begin a record. The logical frame is fullLength bytes, and anything past the
+// last entry is also missing.
+extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) {
+    auto* renderer = static_cast<VulkanRenderer*>(context);
+    if (renderer == nullptr || decodeUnit == nullptr || decodeUnit->bufferList == nullptr || decodeUnit->fullLength <= 0) {
+        return DR_OK;
+    }
+    if (decodeUnit->fullLength > kMaxPyrowaveFrameBytes) {
+        __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame is %d bytes, skipping it", decodeUnit->fullLength);
+        return DR_OK;
+    }
+
+    const size_t fullLength = static_cast<size_t>(decodeUnit->fullLength);
+    static thread_local std::vector<uint8_t> frame;
+    static thread_local std::vector<vkr::PyrowaveDecoder::Gap> gaps;
+    static thread_local std::vector<size_t> recordStarts;
+    frame.resize(fullLength);
+    gaps.clear();
+    recordStarts.clear();
+
+    size_t offset = 0;
+    for (PLENTRY entry = decodeUnit->bufferList; entry != nullptr; entry = entry->next) {
+        if (entry->length <= 0) {
+            __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entry has length %d", entry->length);
+            return DR_OK;
+        }
+        const size_t length = static_cast<size_t>(entry->length);
+        if (offset > fullLength || length > fullLength - offset) {
+            __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entries run past the frame");
+            return DR_OK;
+        }
+        const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
+        if (missing) {
+            memset(frame.data() + offset, 0, length);
+            gaps.push_back({offset, length});
+        }
+        else {
+            memcpy(frame.data() + offset, entry->data, length);
+            if (entry->bufferType == BUFFER_TYPE_RECORD_START) {
+                recordStarts.push_back(offset);
+            }
+        }
+        offset += length;
+    }
+    if (offset < fullLength) {
+        memset(frame.data() + offset, 0, fullLength - offset);
+        gaps.push_back({offset, fullLength - offset});
+    }
+
+    vkr::PyrowaveDecoder::Partial partial = vkr::PyrowaveDecoder::Partial::None;
+    if (decodeUnit->partialFrame) {
+        partial = decodeUnit->partialLate ? vkr::PyrowaveDecoder::Partial::Cut : vkr::PyrowaveDecoder::Partial::Lost;
+    }
+
+    renderer->noteReceived(
+            static_cast<int64_t>(decodeUnit->presentationTimeUs) * 1000,
+            static_cast<int64_t>(decodeUnit->receiveTimeUs) * 1000,
+            static_cast<int64_t>(decodeUnit->enqueueTimeUs) * 1000,
+            static_cast<int64_t>(decodeUnit->frameHostProcessingLatency) * 100000);
+    renderer->submitPyrowaveFrame(
+            frame.data(), frame.size(),
+            gaps.empty() ? nullptr : gaps.data(), gaps.size(),
+            decodeUnit->partialRecords ? &recordStarts : nullptr,
+            partial,
+            static_cast<int64_t>(decodeUnit->presentationTimeUs) * 1000,
+            static_cast<int64_t>(decodeUnit->enqueueTimeUs));
+    return DR_OK;
+}
+
+}
 
 namespace {
     VulkanRenderer* fromHandle(jlong handle) {
@@ -67,6 +147,12 @@ Java_com_limelight_binding_video_VulkanRendererBridge_nativeCreate(
 
     // The renderer holds its own reference
     ANativeWindow_release(output);
+    if (!renderer) {
+        return 0;
+    }
+    if (config.pyrowave) {
+        LiSetPyrowaveFrameSubmit(submitPyrowaveDecodeUnit, renderer.get());
+    }
     return reinterpret_cast<jlong>(renderer.release());
 }
 
@@ -239,5 +325,11 @@ Java_com_limelight_binding_video_VulkanRendererBridge_nativeStop(JNIEnv*, jclass
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_limelight_binding_video_VulkanRendererBridge_nativeDestroy(JNIEnv*, jclass, jlong handle) {
-    delete fromHandle(handle);
+    VulkanRenderer* renderer = fromHandle(handle);
+    if (renderer == nullptr) {
+        return;
+    }
+    // Wait until a frame already being submitted has copied what it needs.
+    LiSetPyrowaveFrameSubmit(nullptr, renderer);
+    delete renderer;
 }
