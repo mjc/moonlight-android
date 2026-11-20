@@ -84,6 +84,136 @@ static uint64_t clockSyncHostUs;
 static uint32_t clockSyncSentSequence[CLOCK_SYNC_SENT_SLOTS];
 static uint64_t clockSyncSentUs[CLOCK_SYNC_SENT_SLOTS];
 
+// FEC window, plus the 15-frame decode queue and the block still being assembled.
+// The window is a few frames, so a second window covers the queue and that block.
+// A miss mallocs a buffer of the same size.
+#define VIDEO_PACKET_POOL_COUNT (RTP_RECV_PACKETS_BUFFERED * 2)
+
+// The packet pointer is the start of the slot. The RTP queue entry stays at
+// packetSize + MAX_RTP_HEADER_SIZE inside it, so a free slot keeps its freelist
+// link in the first word instead of a header in front of the packet.
+static char* videoPacketSlab;
+static uintptr_t videoPacketSlabEnd;
+static void* videoPacketFreeHead;
+static int videoPacketBufferSize;
+static PLT_MUTEX videoPacketPoolLock;
+
+static int videoPacketSlotSize(void) {
+    int size;
+
+    size = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE + (int)sizeof(RTPV_QUEUE_ENTRY);
+    if (size < (int)sizeof(void*)) {
+        return 0;
+    }
+    // Each slot starts aligned, as a malloc buffer would. Spare bytes follow the queue entry.
+    return (size + 15) & ~15;
+}
+
+static void createVideoPacketPool(void) {
+    char* slab;
+    int slotSize;
+    int i;
+    size_t bytes;
+    void* head;
+
+    slotSize = videoPacketSlotSize();
+    videoPacketBufferSize = slotSize;
+    if (slotSize <= 0) {
+        return;
+    }
+
+    bytes = (size_t)VIDEO_PACKET_POOL_COUNT * (size_t)slotSize;
+    slab = (char*)malloc(bytes);
+    if (slab == NULL) {
+        Limelog("Video packet pool: malloc() failed\n");
+        return;
+    }
+    if (PltCreateMutex(&videoPacketPoolLock) != 0) {
+        free(slab);
+        Limelog("Video packet pool: PltCreateMutex() failed\n");
+        return;
+    }
+
+    head = NULL;
+    for (i = VIDEO_PACKET_POOL_COUNT - 1; i >= 0; i--) {
+        char* slot = slab + (size_t)i * (size_t)slotSize;
+        memcpy(slot, &head, sizeof(head));
+        head = slot;
+    }
+    videoPacketFreeHead = head;
+    videoPacketSlabEnd = (uintptr_t)slab + bytes;
+    videoPacketSlab = slab;
+}
+
+static void destroyVideoPacketPool(void) {
+    char* slab;
+
+    // Clear the range before freeing the slab. videoPacketFree() after this
+    // calls free() and does not write into the slab.
+    slab = videoPacketSlab;
+    videoPacketSlab = NULL;
+    videoPacketSlabEnd = 0;
+    videoPacketFreeHead = NULL;
+    if (slab != NULL) {
+        free(slab);
+        PltDeleteMutex(&videoPacketPoolLock);
+    }
+}
+
+static bool videoPacketIsPoolSlot(void* packet) {
+    uintptr_t addr;
+    uintptr_t base;
+
+    if (videoPacketSlab == NULL || packet == NULL || videoPacketBufferSize <= 0) {
+        return false;
+    }
+    addr = (uintptr_t)packet;
+    base = (uintptr_t)videoPacketSlab;
+    if (addr < base || addr >= videoPacketSlabEnd) {
+        return false;
+    }
+    return (addr - base) % (uintptr_t)videoPacketBufferSize == 0;
+}
+
+void* videoPacketAlloc(void) {
+    void* packet;
+
+    if (videoPacketSlab != NULL) {
+        PltLockMutex(&videoPacketPoolLock);
+        packet = videoPacketFreeHead;
+        if (packet != NULL) {
+            memcpy(&videoPacketFreeHead, packet, sizeof(videoPacketFreeHead));
+        }
+        PltUnlockMutex(&videoPacketPoolLock);
+        if (packet != NULL) {
+            return packet;
+        }
+    }
+
+    if (videoPacketBufferSize <= 0) {
+        return NULL;
+    }
+    return malloc((size_t)videoPacketBufferSize);
+}
+
+void videoPacketFree(void* packet) {
+    if (packet == NULL) {
+        return;
+    }
+
+    // Pool memory is identified by the slab range. Any other pointer, including
+    // an ordinary LENTRY and a fallback buffer, is freed.
+    if (!videoPacketIsPoolSlot(packet)) {
+        free(packet);
+        return;
+    }
+
+    PltLockMutex(&videoPacketPoolLock);
+    memcpy(packet, &videoPacketFreeHead, sizeof(videoPacketFreeHead));
+    videoPacketFreeHead = packet;
+    PltUnlockMutex(&videoPacketPoolLock);
+}
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -104,6 +234,7 @@ void initializeVideoStream(void) {
     clockSyncHostUs = 0;
     memset(clockSyncSentSequence, 0, sizeof(clockSyncSentSequence));
     memset(clockSyncSentUs, 0, sizeof(clockSyncSentUs));
+    createVideoPacketPool();
 }
 
 // Clean up the video stream
@@ -113,6 +244,7 @@ void destroyVideoStream(void) {
     RtpvCleanupQueue(&rtpQueue);
     PltDeleteMutex(&partialDeadlineLock);
     PltDeleteMutex(&clockSyncLock);
+    destroyVideoPacketPool();
 }
 
 static void sendClockSyncRequest(LC_SOCKADDR* saddr, uint32_t sequence) {
@@ -335,7 +467,7 @@ static void VideoPingThreadProc(void* context) {
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
     int err;
-    int bufferSize, receiveSize, decryptedSize, minSize;
+    int receiveSize, decryptedSize, minSize;
     char* buffer;
     char* encryptedBuffer;
     int queueStatus;
@@ -347,7 +479,6 @@ static void VideoReceiveThreadProc(void* context) {
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     minSize = sizeof(RTP_PACKET) + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
-    bufferSize = decryptedSize + sizeof(RTPV_QUEUE_ENTRY);
     buffer = NULL;
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
@@ -377,7 +508,7 @@ static void VideoReceiveThreadProc(void* context) {
         PRTP_PACKET packet;
 
         if (buffer == NULL) {
-            buffer = (char*)malloc(bufferSize);
+            buffer = (char*)videoPacketAlloc();
             if (buffer == NULL) {
                 Limelog("Video Receive: malloc() failed\n");
                 ListenerCallbacks.connectionTerminated(-1);
@@ -541,7 +672,7 @@ static void VideoReceiveThreadProc(void* context) {
     }
 
     if (buffer != NULL) {
-        free(buffer);
+        videoPacketFree(buffer);
     }
 
     if (encryptedBuffer != NULL) {

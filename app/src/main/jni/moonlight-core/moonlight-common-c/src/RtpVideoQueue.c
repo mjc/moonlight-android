@@ -29,7 +29,7 @@ static void purgeListEntries(PRTPV_QUEUE_LIST list) {
     while (list->head != NULL) {
         PRTPV_QUEUE_ENTRY entry = list->head;
         list->head = entry->next;
-        free(entry->packet);
+        videoPacketFree(entry->packet);
     }
 
     list->tail = NULL;
@@ -187,7 +187,7 @@ static bool queuePacket(PRTP_VIDEO_QUEUE queue, PRTPV_QUEUE_ENTRY newEntry, PRTP
     Limelog("FEC recovery returned corrupt packet %d" \
             " (frame %d)", rtpPacket->sequenceNumber, \
             queue->currentFrameNumber);               \
-    free(packets[i]);                                 \
+    videoPacketFree(packets[i]);                      \
     continue
 
 // Returns 0 if the frame is completely constructed
@@ -279,7 +279,6 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
     memset(marks, 1, sizeof(char) * (totalPackets));
 
     int receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
-    int packetBufferSize = receiveSize + sizeof(RTPV_QUEUE_ENTRY);
 
 #ifdef FEC_VALIDATION_MODE
     // Choose a packet to drop
@@ -321,7 +320,7 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
     unsigned int i;
     for (i = 0; i < totalPackets; i++) {
         if (marks[i]) {
-            packets[i] = malloc(packetBufferSize);
+            packets[i] = videoPacketAlloc();
             if (packets[i] == NULL) {
                 ret = -4;
                 goto cleanup_packets;
@@ -415,7 +414,7 @@ cleanup_packets:
 
                     // This drop was fake, so we don't want to actually submit it to the depacketizer.
                     // It will get confused because it's already seen this packet before.
-                    free(packets[i]);
+                    videoPacketFree(packets[i]);
                     continue;
                 }
 #endif
@@ -446,7 +445,7 @@ cleanup_packets:
                 LC_ASSERT(isBefore16(rtpPacket->sequenceNumber, queue->bufferFirstParitySequenceNumber));
                 queuePacket(queue, queueEntry, rtpPacket, StreamConfig.packetSize + dataOffset, false, true);
             } else if (packets[i] != NULL) {
-                free(packets[i]);
+                videoPacketFree(packets[i]);
             }
         }
     }
@@ -486,7 +485,7 @@ static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
                 removeEntryFromList(&queue->pendingFecBlockList, parityEntry);
 
                 // Free the entry and packet
-                free(parityEntry->packet);
+                videoPacketFree(parityEntry->packet);
 
                 continue;
             }
@@ -594,7 +593,7 @@ static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue, bool late) {
             shards[completedCount + index] = entry;
         }
         else {
-            free(entry->packet);
+            videoPacketFree(entry->packet);
         }
     }
 
