@@ -61,7 +61,7 @@ vec4 outputColor(vec3 color) {
     if (amplitude > 0.0) {
         // Triangular dither of +/- 1 LSB from two decorrelated noise samples, moved each
         // frame so the pattern averages out over time instead of sitting still.
-        vec2 p = gl_FragCoord.xy + 5.588238 * mod(pc.params.y, 64.0);
+        vec2 p = gl_FragCoord.xy + 5.588238 * pc.params.y;
         float n = ign(p) + ign(p + vec2(47.0, 17.0)) - 1.0;
         color += n * amplitude;
     }
