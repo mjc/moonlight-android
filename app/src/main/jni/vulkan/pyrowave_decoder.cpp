@@ -482,9 +482,10 @@ namespace {
 
 // Drops the highest slots until kept capacity fits in one frame. The first `keep` slots stay.
 // A push passes keep past the slot it is about to hand out, and earlier pushes still hold theirs.
-void trimSpanCopies(std::deque<std::vector<uint8_t>>& copies, size_t keep, size_t& capacity) {
+template <typename Copies>
+void trimSpanCopies(Copies& copies, size_t keep, size_t& capacity) {
     while (capacity > kMaxPyrowaveFrameBytes && copies.size() > keep) {
-        capacity -= copies.back().capacity();
+        capacity -= copies.back().capacity;
         copies.pop_back();
     }
 }
@@ -875,17 +876,14 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (spanCopyUsed_ >= spanCopies_.size()) {
         spanCopies_.emplace_back();
     }
-    if (spanCopies_[spanCopyUsed_].capacity() < length) {
-        const size_t oldCapacity = spanCopies_[spanCopyUsed_].capacity();
-        std::vector<uint8_t> exact(length);
-        spanCopies_[spanCopyUsed_].swap(exact);
-        spanCopyCapacity_ += spanCopies_[spanCopyUsed_].capacity() - oldCapacity;
-    }
-    else if (spanCopies_[spanCopyUsed_].size() != length) {
-        spanCopies_[spanCopyUsed_].resize(length);
+    SpanCopy& spanCopy = spanCopies_[spanCopyUsed_];
+    if (spanCopy.capacity < length) {
+        spanCopy.bytes.reset(new uint8_t[length]);
+        spanCopyCapacity_ += length - spanCopy.capacity;
+        spanCopy.capacity = length;
     }
     trimSpanCopies(spanCopies_, spanCopyUsed_ + 1, spanCopyCapacity_);
-    uint8_t* copy = spanCopies_[spanCopyUsed_].data();
+    uint8_t* copy = spanCopy.bytes.get();
     if (!frame.at(offset, length, copy, spanPushIndex_)) {
         return false;
     }
