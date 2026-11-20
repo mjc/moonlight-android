@@ -34,6 +34,13 @@ static bool receivedFullFrame;
 // and subsequent packet/frame bursts that follow.
 #define RTP_RECV_PACKETS_BUFFERED 2048
 
+// Pull short packet bursts from Android's UDP receive queue with one syscall.
+#ifdef __ANDROID__
+#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 8
+#else
+#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
+#endif
+
 // Where receives can't be made non-blocking per call (Windows), how close to an unfinished
 // frame's deadline the receive thread starts waking up for it even when no packets arrive (see
 // LiSetPartialFrameDeadline()). Further out, it relies on the frame's own packets to wake it,
@@ -468,6 +475,8 @@ static void VideoPingThreadProc(void* context) {
 static void VideoReceiveThreadProc(void* context) {
     int err;
     int receiveSize, decryptedSize, minSize;
+    char* buffers[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
+    char* encryptedBuffers[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
     char* buffer;
     char* encryptedBuffer;
     int queueStatus;
@@ -479,8 +488,6 @@ static void VideoReceiveThreadProc(void* context) {
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     minSize = sizeof(RTP_PACKET) + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
-    buffer = NULL;
-
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
         useSelect = true;
@@ -492,27 +499,31 @@ static void VideoReceiveThreadProc(void* context) {
 
     // Allocate a staging buffer to use for each received packet
     if (encrypted) {
-        encryptedBuffer = (char*)malloc(receiveSize);
-        if (encryptedBuffer == NULL) {
-            Limelog("Video Receive: malloc() failed\n");
-            ListenerCallbacks.connectionTerminated(-1);
-            return;
+        for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+            encryptedBuffers[i] = (char*)malloc(receiveSize);
+            if (encryptedBuffers[i] == NULL) {
+                Limelog("Video Receive: malloc() failed\n");
+                for (int j = 0; j < i; j++) {
+                    free(encryptedBuffers[j]);
+                }
+                ListenerCallbacks.connectionTerminated(-1);
+                return;
+            }
         }
-    }
-    else {
-        encryptedBuffer = NULL;
     }
 
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
 
-        if (buffer == NULL) {
-            buffer = (char*)videoPacketAlloc();
-            if (buffer == NULL) {
-                Limelog("Video Receive: malloc() failed\n");
-                ListenerCallbacks.connectionTerminated(-1);
-                break;
+        for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+            if (buffers[i] == NULL) {
+                buffers[i] = (char*)videoPacketAlloc();
+                if (buffers[i] == NULL) {
+                    Limelog("Video Receive: malloc() failed\n");
+                    ListenerCallbacks.connectionTerminated(-1);
+                    goto cleanup;
+                }
             }
         }
 
@@ -523,6 +534,57 @@ static void VideoReceiveThreadProc(void* context) {
         // made non-blocking per call, it waits in select() once the deadline is close; a recv()
         // with a short SO_RCVTIMEO there often went 10 ms without returning.
         int64_t untilDeadlineUs = checkPartialFrameDeadline();
+        int receivedCount = 0;
+#ifdef __ANDROID__
+        struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
+        struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
+        for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+            vectors[i].iov_base = encrypted ? encryptedBuffers[i] : buffers[i];
+            vectors[i].iov_len = receiveSize;
+            messages[i].msg_hdr.msg_iov = &vectors[i];
+            messages[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        if (untilDeadlineUs >= 0 || useSelect) {
+            struct pollfd pfd;
+            int timeoutMs = untilDeadlineUs >= 0 ? (int)((untilDeadlineUs + 999) / 1000)
+                                                 : UDP_RECV_POLL_TIMEOUT_MS;
+            if (timeoutMs > UDP_RECV_POLL_TIMEOUT_MS) {
+                timeoutMs = UDP_RECV_POLL_TIMEOUT_MS;
+            }
+            pfd.fd = rtpSocket;
+            pfd.events = POLLIN;
+
+            // Drain anything already queued without waiting past a partial-frame deadline.
+            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_DONTWAIT, NULL);
+            if (receivedCount < 0 && (LastSocketError() == EWOULDBLOCK || LastSocketError() == EAGAIN ||
+                                      LastSocketError() == EINTR)) {
+                if (pollSockets(&pfd, 1, timeoutMs) == 0) {
+                    // Nothing arrived before the deadline or receive timeout.
+                    receivedCount = 0;
+                }
+                else {
+                    receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE,
+                                             MSG_DONTWAIT, NULL);
+                }
+            }
+        }
+        else {
+            // Wait for the first datagram, then take only the rest of the current burst.
+            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_WAITFORONE, NULL);
+        }
+
+        if (receivedCount < 0) {
+            if (LastSocketError() == EWOULDBLOCK || LastSocketError() == EAGAIN || LastSocketError() == EINTR) {
+                receivedCount = 0;
+            }
+            else {
+                Limelog("Video Receive: recvmmsg() failed: %d\n", (int)LastSocketError());
+                ListenerCallbacks.connectionTerminated(LastSocketFail());
+                break;
+            }
+        }
+#else
         bool received = false;
         if (untilDeadlineUs >= 0) {
             struct pollfd pfd;
@@ -534,7 +596,7 @@ static void VideoReceiveThreadProc(void* context) {
             pfd.fd = rtpSocket;
             pfd.events = POLLIN;
 #ifdef MSG_DONTWAIT
-            err = (int)recvfrom(rtpSocket, encrypted ? encryptedBuffer : buffer, receiveSize, MSG_DONTWAIT, NULL, NULL);
+            err = (int)recvfrom(rtpSocket, encrypted ? encryptedBuffers[0] : buffers[0], receiveSize, MSG_DONTWAIT, NULL, NULL);
             if (err >= 0) {
                 received = true;
             }
@@ -554,7 +616,7 @@ static void VideoReceiveThreadProc(void* context) {
 
         if (!received) {
             err = recvUdpSocket(rtpSocket,
-                                encrypted ? encryptedBuffer : buffer,
+                                encrypted ? encryptedBuffers[0] : buffers[0],
                                 receiveSize,
                                 useSelect);
         }
@@ -563,7 +625,10 @@ static void VideoReceiveThreadProc(void* context) {
             ListenerCallbacks.connectionTerminated(LastSocketFail());
             break;
         }
-        else if  (err == 0) {
+        else if (err > 0) {
+            receivedCount = 1;
+        }
+        else {
             if (!receivedDataFromPeer) {
                 // If we wait many seconds without ever receiving a video packet,
                 // assume something is broken and terminate the connection.
@@ -578,105 +643,135 @@ static void VideoReceiveThreadProc(void* context) {
             // Receive timed out; try again
             continue;
         }
-
-        // A clock sync reply, which can't be a video packet (see SS_CLOCK_SYNC_REPLY)
-        if (err == sizeof(SS_CLOCK_SYNC_REPLY)) {
-            uint64_t receivedUs = PltGetMicroseconds();
-            PSS_CLOCK_SYNC_REPLY reply = (PSS_CLOCK_SYNC_REPLY)(encrypted ? encryptedBuffer : buffer);
-
-            if (LE32(reply->magic) == SS_CLOCK_SYNC_REPLY_MAGIC) {
-                handleClockSyncReply(reply, receivedUs);
-                continue;
-            }
-        }
-
-        // Every packet counts, including FEC, duplicates, and packets of frames that are
-        // later dropped
-        rtpQueue.stats.byteCountReceived += (uint32_t)err;
-        rtpQueue.stats.packetCountReceived++;
-
-        if (!receivedDataFromPeer) {
-            receivedDataFromPeer = true;
-            Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
-
-            firstDataTimeMs = PltGetMillis();
-        }
-
-#ifndef LC_FUZZING
-        if (!receivedFullFrame) {
-            if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
-                Limelog("Terminating connection due to lack of a successful video frame\n");
-                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
-                break;
-            }
-        }
 #endif
 
-        if (err < minSize) {
-            // Runt packet
+        if (receivedCount == 0) {
+            if (untilDeadlineUs < 0 && !receivedDataFromPeer) {
+                // If we wait many seconds without ever receiving a video packet,
+                // assume something is broken and terminate the connection.
+                waitingForVideoMs += UDP_RECV_POLL_TIMEOUT_MS;
+                if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                    Limelog("Terminating connection due to lack of video traffic\n");
+                    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
+                    break;
+                }
+            }
             continue;
         }
 
-        // Decrypt the packet into the buffer if encryption is enabled
-        if (encrypted) {
-            PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
+        bool fatalPacket = false;
+        for (int batchIndex = 0; batchIndex < receivedCount; batchIndex++) {
+            buffer = buffers[batchIndex];
+            encryptedBuffer = encrypted ? encryptedBuffers[batchIndex] : NULL;
+#ifdef __ANDROID__
+            err = (int)messages[batchIndex].msg_len;
+#endif
+            // Keep deadline handling at packet granularity, even while draining a burst.
+            checkPartialFrameDeadline();
 
-            // If this frame is below our current frame number, discard it before decryption
-            // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
-            //
-            // Since this is happening _before_ decryption, this packet is not trusted yet.
-            // It's imperative that we do not mutate any state based on this packet until
-            // after it has been decrypted successfully!
-            //
-            // It's possible for an attacker to inject a fake packet that has any value of
-            // header fields they want, however this provides them no benefit because we will
-            // simply drop said packet here (if it's below the current frame number) or it
-            // will pass this check and be dropped during decryption (if contents is tampered)
-            // or after decryption in the RTP queue (if it's a replay of a previous authentic
-            // packet from the host).
-            //
-            // In short, an attacker spoofing this value via MITM or sending malicious values
-            // impersonating the host from off-link doesn't gain them anything. If they have
-            // a true MITM, they can DoS our connection by just dropping all our traffic, so
-            // tampering with packets to fail this check doesn't accomplish anything they
-            // couldn't already do. If they're not on-link, we just throw their malicious
-            // traffic away (as mentioned in the paragraph above) and continue accepting
-            // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+            // A clock sync reply, which can't be a video packet (see SS_CLOCK_SYNC_REPLY)
+            if (err == sizeof(SS_CLOCK_SYNC_REPLY)) {
+                uint64_t receivedUs = PltGetMicroseconds();
+                PSS_CLOCK_SYNC_REPLY reply = (PSS_CLOCK_SYNC_REPLY)(encrypted ? encryptedBuffer : buffer);
+
+                if (LE32(reply->magic) == SS_CLOCK_SYNC_REPLY_MAGIC) {
+                    handleClockSyncReply(reply, receivedUs);
+                    continue;
+                }
+            }
+
+            // Every packet counts, including FEC, duplicates, and packets of frames that are
+            // later dropped
+            rtpQueue.stats.byteCountReceived += (uint32_t)err;
+            rtpQueue.stats.packetCountReceived++;
+
+            if (!receivedDataFromPeer) {
+                receivedDataFromPeer = true;
+                Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+
+                firstDataTimeMs = PltGetMillis();
+            }
+
+#ifndef LC_FUZZING
+            if (!receivedFullFrame) {
+                if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                    Limelog("Terminating connection due to lack of a successful video frame\n");
+                    ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                    fatalPacket = true;
+                    break;
+                }
+            }
+#endif
+
+            if (err < minSize) {
+                // Runt packet
                 continue;
             }
 
-            if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
-                                   (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                                   encHeader->iv, sizeof(encHeader->iv),
-                                   encHeader->tag, sizeof(encHeader->tag),
-                                   ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
-                                   (unsigned char*)buffer, &err)) {
-                Limelog("Failed to decrypt video packet!\n");
-                continue;
+            // Decrypt the packet into the buffer if encryption is enabled
+            if (encrypted) {
+                PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)encryptedBuffer;
+
+                // If this frame is below our current frame number, discard it before decryption
+                // to save CPU cycles decrypting FEC shards for a frame we already reassembled.
+                //
+                // Since this is happening _before_ decryption, this packet is not trusted yet.
+                // It's imperative that we do not mutate any state based on this packet until
+                // after it has been decrypted successfully!
+                //
+                // It's possible for an attacker to inject a fake packet that has any value of
+                // header fields they want, however this provides them no benefit because we will
+                // simply drop said packet here (if it's below the current frame number) or it
+                // will pass this check and be dropped during decryption (if contents is tampered)
+                // or after decryption in the RTP queue (if it's a replay of a previous authentic
+                // packet from the host).
+                //
+                // In short, an attacker spoofing this value via MITM or sending malicious values
+                // impersonating the host from off-link doesn't gain them anything. If they have
+                // a true MITM, they can DoS our connection by just dropping all our traffic, so
+                // tampering with packets to fail this check doesn't accomplish anything they
+                // couldn't already do. If they're not on-link, we just throw their malicious
+                // traffic away (as mentioned in the paragraph above) and continue accepting
+                // legitmate video traffic.
+                if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                    continue;
+                }
+
+                if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
+                                       (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                                       encHeader->iv, sizeof(encHeader->iv),
+                                       encHeader->tag, sizeof(encHeader->tag),
+                                       ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER), // The ciphertext is after the header
+                                       (unsigned char*)buffer, &err)) {
+                    Limelog("Failed to decrypt video packet!\n");
+                    continue;
+                }
+            }
+
+            // Convert fields to host byte-order
+            packet = (PRTP_PACKET)&buffer[0];
+            packet->sequenceNumber = BE16(packet->sequenceNumber);
+            packet->timestamp = BE32(packet->timestamp);
+            packet->ssrc = BE32(packet->ssrc);
+
+            queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+
+            if (queueStatus == RTPF_RET_QUEUED) {
+                // The queue owns the buffer
+                buffers[batchIndex] = NULL;
             }
         }
-
-        // Convert fields to host byte-order
-        packet = (PRTP_PACKET)&buffer[0];
-        packet->sequenceNumber = BE16(packet->sequenceNumber);
-        packet->timestamp = BE32(packet->timestamp);
-        packet->ssrc = BE32(packet->ssrc);
-
-        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
-
-        if (queueStatus == RTPF_RET_QUEUED) {
-            // The queue owns the buffer
-            buffer = NULL;
+        if (fatalPacket) {
+            break;
         }
     }
 
-    if (buffer != NULL) {
-        videoPacketFree(buffer);
-    }
-
-    if (encryptedBuffer != NULL) {
-        free(encryptedBuffer);
+cleanup:
+    for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+        if (buffers[i] != NULL) {
+            videoPacketFree(buffers[i]);
+        }
+        free(encryptedBuffers[i]);
     }
 }
 
