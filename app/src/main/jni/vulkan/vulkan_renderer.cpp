@@ -1028,7 +1028,6 @@ void VulkanRenderer::pyrowaveWaiterMain() {
                 arrivalNs += lastDecodeGpuNs_;
             }
             frame->timing.arrivalNs = arrivalNs;
-            noteDecoded(*frame, frame->timing.arrivalNs, false);
             FramePtr held = frame;
             enqueueFrame(std::move(frame), false);
             // Nothing queued the frame (the renderer is closing, or the draw was not submitted).
