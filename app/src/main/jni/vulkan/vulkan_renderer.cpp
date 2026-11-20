@@ -46,6 +46,7 @@ namespace {
     constexpr float kOutputPassthrough = 0.0f;
     constexpr float kOutputPqToSdr = 1.0f;
     constexpr float kSdrWhiteNits = 203.0f;
+    constexpr float kPqToSdrScale = 10000.0f / kSdrWhiteNits;
 
     // Quarter turns clockwise for a pre-rotation, or -1 for a transform we can't render
     int quarterTurns(VkSurfaceTransformFlagBitsKHR transform) {
@@ -2237,8 +2238,8 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     pc.params[0] = ditherAmplitude;
     pc.params[1] = static_cast<float>(frameCounter_ % 64);
     pc.params[2] = (hdrActive_ && !outputPq_) ? kOutputPqToSdr : kOutputPassthrough;
-    pc.params[3] = contentPeakNits;
-    pc.params2[0] = kSdrWhiteNits;
+    pc.params[3] = std::max(contentPeakNits / kSdrWhiteNits, 1.0f);
+    pc.params2[0] = kPqToSdrScale;
     pc.params2[1] = static_cast<float>(std::max(quarterTurns(preTransform_), 0));
     if (planar) {
         // PyroWave is always full range, in the colorspace we asked for, or BT.2020 for HDR

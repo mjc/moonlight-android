@@ -5,8 +5,8 @@
 layout(push_constant) uniform PushConstants {
     vec4 uvRect;
     vec4 uvClamp;
-    vec4 params;   // x = dither amplitude, y = frame counter, z = output mode, w = content peak nits
-    vec4 params2;  // x = SDR reference white, y = quarter turns, z/w = planar green Cb/Cr coefficients
+    vec4 params;   // x = dither amplitude, y = frame counter, z = output mode, w = tone-map white ratio
+    vec4 params2;  // x = PQ-to-SDR scale, y = quarter turns, z/w = planar green Cb/Cr coefficients
     vec4 ycbcr;    // Planar video: x/y = red Cr and blue Cb scales, z = chroma midpoint, w = chroma U offset
 } pc;
 
@@ -32,8 +32,7 @@ vec3 pqToLinear(vec3 e) {
 
 // HDR10 content on a surface that cannot take it: map to SDR BT.709
 vec3 pqToSdr(vec3 e) {
-    float sdrWhite = pc.params2.x;
-    vec3 lin = pqToLinear(e) * (10000.0 / sdrWhite);
+    vec3 lin = pqToLinear(e) * pc.params2.x;
 
     // BT.2020 to BT.709 primaries (column-major)
     lin = mat3(1.6605, -0.1246, -0.0182,
@@ -42,7 +41,7 @@ vec3 pqToSdr(vec3 e) {
     lin = max(lin, 0.0);
 
     // Extended Reinhard on luminance, with the content peak mapped to SDR white
-    float white = max(pc.params.w / sdrWhite, 1.0);
+    float white = pc.params.w;
     float l = dot(lin, vec3(0.2126, 0.7152, 0.0722));
     if (l > 0.0) {
         float lt = l * (1.0 + l / (white * white)) / (1.0 + l);
