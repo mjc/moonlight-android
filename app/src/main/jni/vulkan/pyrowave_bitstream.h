@@ -148,6 +148,68 @@ struct PyrowaveBytes {
         }
         return filled == length ? scratch : nullptr;
     }
+
+    // Read records in ascending offset order without binary-searching the spans for each one.
+    const uint8_t* at(size_t offset, size_t length, uint8_t* scratch, size_t& spanIndex) const {
+        if (length == 0) {
+            return scratch;
+        }
+        if (spanCount == 0) {
+            if (data == nullptr || offset > size || length > size - offset) {
+                return nullptr;
+            }
+            return data + offset;
+        }
+        const size_t end = offset + length;
+        if (end < offset) {
+            return nullptr;
+        }
+        while (spanIndex < spanCount) {
+            const PyrowaveSpan& span = spans[spanIndex];
+            const size_t spanEnd = span.offset + span.length;
+            if (span.length == 0 || span.data == nullptr || spanEnd < span.offset) {
+                return nullptr;
+            }
+            if (spanEnd > offset) {
+                break;
+            }
+            spanIndex++;
+        }
+
+        size_t filled = 0;
+        for (size_t i = spanIndex; i < spanCount; i++) {
+            const PyrowaveSpan& span = spans[i];
+            if (span.length == 0 || span.data == nullptr) {
+                return nullptr;
+            }
+            const size_t spanEnd = span.offset + span.length;
+            if (spanEnd < span.offset) {
+                return nullptr;
+            }
+            if (spanEnd <= offset) {
+                continue;
+            }
+            if (span.offset >= end) {
+                break;
+            }
+            const size_t from = offset > span.offset ? offset : span.offset;
+            const size_t to = end < spanEnd ? end : spanEnd;
+            if (from != offset + filled) {
+                return nullptr;
+            }
+            const size_t n = to - from;
+            if (filled == 0 && to == end) {
+                spanIndex = i;
+                return span.data + (from - span.offset);
+            }
+            if (scratch == nullptr) {
+                return nullptr;
+            }
+            memcpy(scratch + filled, span.data + (from - span.offset), n);
+            filled += n;
+        }
+        return filled == length ? scratch : nullptr;
+    }
 };
 
 namespace pyrowave_bitstream {
@@ -354,14 +416,16 @@ bool pushRecords(const PyrowaveBytes& frame, Push push) {
     using namespace pyrowave_bitstream;
     const size_t size = frame.size;
     uint8_t headerScratch[kHeaderSize];
+    size_t headerSpanIndex = 0;
 
     size_t runStart = 0;
+    size_t runSpanIndex = 0;
     size_t pos = 0;
     while (pos < size) {
         if (size - pos < kHeaderSize) {
             return false;
         }
-        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch);
+        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch, headerSpanIndex);
         if (!hdr) {
             return false;
         }
@@ -388,11 +452,16 @@ bool pushRecords(const PyrowaveBytes& frame, Push push) {
         }
         const size_t end = pos + length;
         // Same split as pushArrivedBlocks: complete records in one span stay one push.
-        if (runStart < pos && !frame.oneSpan(runStart, end - runStart)) {
-            if (!push(runStart, pos - runStart)) {
-                return false;
+        if (runStart < pos && frame.spanCount != 0) {
+            const PyrowaveSpan& runSpan = frame.spans[runSpanIndex];
+            const size_t runSpanEnd = runSpan.offset + runSpan.length;
+            if (runSpanEnd < runSpan.offset || runStart < runSpan.offset || end > runSpanEnd) {
+                if (!push(runStart, pos - runStart)) {
+                    return false;
+                }
+                runStart = pos;
+                runSpanIndex = headerSpanIndex;
             }
-            runStart = pos;
         }
         pos = end;
     }
