@@ -1014,12 +1014,17 @@ void VulkanRenderer::pyrowaveWaiterMain() {
         }
 
         // The draw is queued before the fence wait, so the next decode can follow it on this queue.
-        // The pacer's arrival includes the previous decode's GPU time. This one was just
-        // submitted and is not ready to show. Decode latency and the partial-frame deadline
-        // use the time the fence actually returns.
+        // This frame was submitted while the previous fence wait blocked this thread, so that
+        // work can already be done. A zero-timeout poll uses now for a finished decode and the
+        // previous decode's GPU time for one still running. Decode latency and the partial-frame
+        // deadline use the time the fence actually returns.
         const bool shareQueue = pyrowaveSharesQueue_;
         if (shareQueue) {
-            frame->timing.arrivalNs = nowNs() + lastDecodeGpuNs_;
+            int64_t arrivalNs = nowNs();
+            if (lastDecodeGpuNs_ > 0 && pyrowave_->waitDecoded(frame->readyValue, 0) != VK_SUCCESS) {
+                arrivalNs += lastDecodeGpuNs_;
+            }
+            frame->timing.arrivalNs = arrivalNs;
             noteDecoded(*frame, frame->timing.arrivalNs, false);
             FramePtr held = frame;
             enqueueFrame(std::move(frame), false);
@@ -1542,6 +1547,14 @@ void VulkanRenderer::enqueueFrame(FramePtr frame, bool countLatency) {
             lastDecodedNs_ = frame->timing.arrivalNs;
         }
         trace_.frame(frame->timing, pending_.size() + 1, queueOverflowDrops_);
+        // Before the frame can be drawn or dropped. present-on-arrival only wakes the render
+        // thread, and an aligned front buffer draws later, so resume() can run while the
+        // fence does not exist yet. The hold keeps chunks unsubmitted across that gap.
+        if (frame->sharedBlit && keepBusyGroups_ != 0) {
+            frame->keepBusy = &keepBusy_;
+            frame->blitHold.store(true, std::memory_order_relaxed);
+            keepBusy_.holdUnarmedBlit();
+        }
         pending_.push_back(std::move(frame));
         while (pending_.size() > pacer_.maxQueued()) {
             dropped.push_back(std::move(pending_.front()));
@@ -2018,6 +2031,10 @@ void VulkanRenderer::presentAhead() {
                          pacer_);
         }
         if (frontBufferPaced_) {
+            // Drawn when the scan is about to start. Writing the shared image earlier puts
+            // the frame on screen then. The keep-busy hold lasts until that draw arms its
+            // fence. On a shared queue the next decode waits for the same submit: the blit
+            // semaphore is binary, so the draw has to be queued first.
             queueAlignedDraw({std::move(frame), presentId, showVsyncNs, commitNs});
         }
         else if (renderFrame(frame, presentId, showVsyncNs, true, commitNs)) {
@@ -2387,7 +2404,8 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
     }
     if (frame->sharedBlit && keepBusyGroups_ != 0) {
         const uint64_t generation = ++nextBlitGen_;
-        if (keepBusy_.armBlitGate(vk_.vkWaitForFences, device_, fences_[slot], generation)) {
+        const bool releaseHold = frame->blitHold.exchange(false, std::memory_order_relaxed);
+        if (keepBusy_.armBlitGate(vk_.vkWaitForFences, device_, fences_[slot], generation, releaseHold)) {
             slotBlitGen_[slot] = generation;
         }
     }

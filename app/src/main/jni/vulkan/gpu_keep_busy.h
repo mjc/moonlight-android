@@ -43,10 +43,18 @@ public:
     // Finishes every chunk already submitted. Submits nothing until resume().
     void pause();
     void resume();
+    // A shared-queue frame is queued and its draw fence is not armed yet. Chunks stay
+    // unsubmitted while any such frame is outstanding. armBlitGate and releaseUnarmedBlit
+    // each drop one. The frame's destructor releases a hold the draw never armed.
+    void holdUnarmedBlit();
+    void releaseUnarmedBlit();
     // Chunks started after resume wait until this fence signals. The fence belongs to
-    // another device. retireBlit must run before that fence is reset, and it waits out
-    // a wait already inside vkWaitForFences. generation is the submit's id.
-    bool armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation);
+    // another device. retireBlit must run before that fence is reset, and it waits until
+    // a wait already inside vkWaitForFences has returned, including while this thread is
+    // stopping. generation is the submit's id. releaseHold drops one holdUnarmedBlit
+    // under the same lock that publishes the fence.
+    bool armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation,
+                     bool releaseHold);
     void retireBlit(uint64_t generation);
 
 private:
@@ -99,6 +107,8 @@ private:
     uint64_t blitWaitedGeneration_ = 0;
     uint64_t blitWaitingGeneration_ = 0;
     int blitWaiters_ = 0;
+    // Shared-queue frames queued whose draw fence is not armed yet. Under pauseMutex_.
+    int unarmedBlits_ = 0;
 };
 
 }  // namespace vkr

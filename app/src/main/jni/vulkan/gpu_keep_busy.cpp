@@ -54,6 +54,7 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
         blitWaitedGeneration_ = 0;
         blitWaitingGeneration_ = 0;
         blitWaiters_ = 0;
+        unarmedBlits_ = 0;
         blitFence_ = VK_NULL_HANDLE;
     }
     thread_ = std::thread(&GpuKeepBusy::run, this);
@@ -83,12 +84,30 @@ void GpuKeepBusy::pause() {
     pauseCv_.wait(lock, [this] { return quit_.load() || inFlight_ == 0; });
 }
 
-bool GpuKeepBusy::armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation) {
-    if (!wait || device == VK_NULL_HANDLE || fence == VK_NULL_HANDLE || generation == 0) {
-        return false;
-    }
+void GpuKeepBusy::holdUnarmedBlit() {
     std::lock_guard<std::mutex> lock(pauseMutex_);
-    if (quit_ || !thread_.joinable()) {
+    unarmedBlits_++;
+}
+
+void GpuKeepBusy::releaseUnarmedBlit() {
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    if (unarmedBlits_ > 0) {
+        unarmedBlits_--;
+    }
+    pauseCv_.notify_all();
+}
+
+bool GpuKeepBusy::armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation,
+                              bool releaseHold) {
+    std::lock_guard<std::mutex> lock(pauseMutex_);
+    // The fence and the hold change together. A worker waiting on the hold must not
+    // wake, see no hold, and submit before this fence is the one it waits.
+    if (releaseHold && unarmedBlits_ > 0) {
+        unarmedBlits_--;
+    }
+    if (!wait || device == VK_NULL_HANDLE || fence == VK_NULL_HANDLE || generation == 0 || quit_ ||
+            !thread_.joinable()) {
+        pauseCv_.notify_all();
         return false;
     }
     blitWait_ = wait;
@@ -104,9 +123,12 @@ void GpuKeepBusy::retireBlit(uint64_t generation) {
         return;
     }
     std::unique_lock<std::mutex> lock(pauseMutex_);
+    // stop() joins this thread while the render thread can be here, and the next step
+    // resets the fence. Wait until vkWaitForFences has returned. The waiter clears
+    // blitWaiters_ itself, so this wait still lets the join finish.
     if (blitWaiters_ > 0 && blitWaitingGeneration_ == generation) {
         pauseCv_.wait(lock, [this, generation] {
-            return blitWaiters_ == 0 || blitWaitingGeneration_ != generation || quit_.load();
+            return blitWaiters_ == 0 || blitWaitingGeneration_ != generation;
         });
     }
     if (!quit_ && blitGeneration_ == generation) {
@@ -127,39 +149,55 @@ bool GpuKeepBusy::submitPair(std::unique_lock<std::mutex>& lock) {
 }
 
 bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock) {
-    while (!quit_ && blitWait_ && blitFence_ != VK_NULL_HANDLE && blitGeneration_ != blitWaitedGeneration_) {
-        const uint64_t generation = blitGeneration_;
-        const VkFence fence = blitFence_;
-        const VkDevice device = blitDevice_;
-        const PFN_vkWaitForFences wait = blitWait_;
-        blitWaitingGeneration_ = generation;
-        blitWaiters_ = 1;
-        bool signaled = false;
-        while (!quit_ && !paused_ && blitGeneration_ == generation) {
-            lock.unlock();
-            const VkResult result = wait(device, 1, &fence, VK_TRUE, 20'000'000ULL);
-            lock.lock();
-            if (result == VK_TIMEOUT) {
-                continue;
-            }
-            // Signaled, or the device can no longer signal it. Either way, stop waiting.
-            signaled = true;
-            break;
-        }
-        blitWaiters_ = 0;
-        blitWaitingGeneration_ = 0;
-        pauseCv_.notify_all();
+    for (;;) {
         if (quit_) {
             return false;
         }
-        if (signaled && blitGeneration_ == generation) {
-            blitWaitedGeneration_ = generation;
-        }
-        if (!signaled) {
+        if (paused_) {
             return true;
         }
+        if (blitWait_ && blitFence_ != VK_NULL_HANDLE && blitGeneration_ != blitWaitedGeneration_) {
+            const uint64_t generation = blitGeneration_;
+            const VkFence fence = blitFence_;
+            const VkDevice device = blitDevice_;
+            const PFN_vkWaitForFences wait = blitWait_;
+            blitWaitingGeneration_ = generation;
+            blitWaiters_ = 1;
+            bool signaled = false;
+            while (!quit_ && !paused_ && blitGeneration_ == generation) {
+                lock.unlock();
+                const VkResult result = wait(device, 1, &fence, VK_TRUE, 20'000'000ULL);
+                lock.lock();
+                if (result == VK_TIMEOUT) {
+                    continue;
+                }
+                // Signaled, or the device can no longer signal it. Either way, stop waiting.
+                signaled = true;
+                break;
+            }
+            blitWaiters_ = 0;
+            blitWaitingGeneration_ = 0;
+            pauseCv_.notify_all();
+            if (quit_) {
+                return false;
+            }
+            if (signaled && blitGeneration_ == generation) {
+                blitWaitedGeneration_ = generation;
+            }
+            // A timeout after a newer draw replaced this fence used to return here and
+            // both callers submitted. Stay on the new fence. A pause still returns so
+            // the chunks already in flight can drain.
+            if (!signaled && paused_) {
+                return true;
+            }
+            continue;
+        }
+        if (unarmedBlits_ > 0) {
+            pauseCv_.wait(lock, [this] { return quit_.load() || paused_ || unarmedBlits_ == 0; });
+            continue;
+        }
+        return true;
     }
-    return !quit_;
 }
 
 void GpuKeepBusy::stopRun(std::unique_lock<std::mutex>& lock) {

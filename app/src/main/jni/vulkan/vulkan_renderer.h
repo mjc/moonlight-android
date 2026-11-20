@@ -54,6 +54,10 @@ struct VideoFrame {
     VideoFrame(PyrowaveDecoder* decoder, PyrowavePlanes* planes, uint64_t readyValue)
         : pyrowave(decoder), planes(planes), readyValue(readyValue) {}
     ~VideoFrame() {
+        // The draw never armed its fence. Let keep-busy submit again.
+        if (blitHold.exchange(false) && keepBusy) {
+            keepBusy->releaseUnarmedBlit();
+        }
         if (sharedBlit && pyrowave) {
             pyrowave->abandonSharedBlit(readyValue, blitPhase, ownsBlitSem);
         }
@@ -76,6 +80,10 @@ struct VideoFrame {
     bool sharedBlit = false;
     bool ownsBlitSem = false;
     std::atomic<int> blitPhase {0};
+    // Set while this frame is queued on a shared queue and its draw fence is not armed.
+    // The destructor releases the hold if the draw never happens.
+    GpuKeepBusy* keepBusy = nullptr;
+    std::atomic<bool> blitHold {false};
     int64_t decodeStartNs = 0;   // Handed to the renderer
     int64_t decodeQueuedNs = 0;  // Decode queued on the GPU
     PyrowaveDecoder::DecodeTimes decodeTimes;  // Where the time until then went
@@ -643,8 +651,8 @@ private:
     // Pause keep-busy around a decode submit. beforeDecodeSubmit runs after the shared-queue
     // blit wait and before vkQueueSubmit, and it returns only once the chunks already on the
     // GPU have finished. finishOutstandingDecode runs once that submit's fence wait has
-    // returned, or the submit failed, or the frame was not queued. New chunks then wait until
-    // the draw's fence has signaled.
+    // returned, or the submit failed, or the frame was not queued. New chunks then wait while a
+    // shared-queue frame is still queued without a draw fence, and until that fence has signaled.
     void beforeDecodeSubmit();
     void finishOutstandingDecode();
     static void beforeDecodeSubmitThunk(void* userdata);
@@ -654,8 +662,9 @@ private:
     CaptureLatency captureLatency_;
 
     // The PyroWave waiting thread's: when the last decode it timed ended on the GPU,
-    // and how long that decode occupied the GPU. The next shared-queue frame's pacer
-    // arrival adds the duration: the decode just submitted is still running.
+    // and how long that decode occupied the GPU. The next shared-queue frame is paced
+    // from now when a zero-timeout poll shows its decode already finished, and that
+    // long from now when the fence is still unsignaled.
     int64_t lastDecodeGpuEndNs_ = 0;
     int64_t lastDecodeGpuNs_ = 0;
 
