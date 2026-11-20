@@ -779,12 +779,12 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     *readyValue = ++lastValue_;
 
     // GPU time per decode, by stage, over the last interval
-    const int64_t statsNs = startNs;
+    const int64_t now = nowNs();
     if (lastStatsNs_ == 0) {
-        lastStatsNs_ = statsNs;
+        lastStatsNs_ = now;
     }
-    else if (statsNs - lastStatsNs_ >= kStatsIntervalNs) {
-        lastStatsNs_ = statsNs;
+    else if (now - lastStatsNs_ >= kStatsIntervalNs) {
+        lastStatsNs_ = now;
         api.reportPerformanceStats(device_, &logStat, nullptr, true);
         if (partialDecoded_ != 0 || partialDropped_ != 0) {
             ALOGI("Partial frames (lost packets or cut short): %u decoded from what arrived, %u too incomplete to decode",
