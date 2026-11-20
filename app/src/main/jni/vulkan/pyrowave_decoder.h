@@ -314,7 +314,8 @@ private:
     bool blitQuit_ = false;
     // One buffer per run that crosses spans, so a later run cannot reallocate an earlier push.
     // Kept across frames and reused. A push may hold the pointer until decode_gpu_buffer
-    // returns, which is before the next decode.
+    // returns, which is before the next decode. The next decode drops the highest slots
+    // until the kept capacity is within one frame.
     std::deque<std::vector<uint8_t>> spanCopies_;
     size_t spanCopyUsed_ = 0;
 

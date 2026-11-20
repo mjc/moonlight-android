@@ -476,6 +476,17 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     queueHeldNs_ = 0;
     queueHolds_ = 0;
     spanCopyUsed_ = 0;
+    // The previous frame's pointers died when its decode_gpu_buffer returned. Slots keep
+    // the largest run they have held, so the total can pass one frame. Drop the highest
+    // until it fits; the low slots are the runs that come first.
+    size_t spanCapacity = 0;
+    for (const std::vector<uint8_t>& copy : spanCopies_) {
+        spanCapacity += copy.capacity();
+    }
+    while (spanCapacity > kMaxPyrowaveFrameBytes && !spanCopies_.empty()) {
+        spanCapacity -= spanCopies_.back().capacity();
+        spanCopies_.pop_back();
+    }
     signaledBlit_ = false;
     *times = {};
 
