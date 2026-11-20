@@ -123,6 +123,8 @@ public:
         void (*beforeDecodeSubmit)(void* userdata) = nullptr;
         void (*decodeSubmitDropped)(void* userdata) = nullptr;
         void* submitUserdata = nullptr;
+        // Optional: internal PyroWave queue-hold timings are only needed in recorded traces.
+        const std::atomic<bool>* traceRecording = nullptr;
     };
 
     // Null if PyroWave can't decode on this device. width and height must be even.
@@ -300,6 +302,7 @@ private:
     int64_t queueLockedNs_ = 0;
     int64_t queueHeldNs_ = 0;
     int queueHolds_ = 0;
+    bool queueSubmitTimingEnabled_ = false;
 
     // Signaled with each decode's value. Decodes wait for the one before, which also keeps one
     // from writing planes an earlier, dropped frame is still being decoded into. Without timeline

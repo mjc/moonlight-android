@@ -977,6 +977,7 @@ bool VulkanRenderer::createPyrowaveDecoder() {
     info.beforeDecodeSubmit = &VulkanRenderer::beforeDecodeSubmitThunk;
     info.decodeSubmitDropped = &VulkanRenderer::decodeSubmitDroppedThunk;
     info.submitUserdata = this;
+    info.traceRecording = &traceRecording_;
     pyrowave_ = PyrowaveDecoder::create(decodeDevice_ ? decodeVk_ : vk_, info, config_.streamWidth,
                                         config_.streamHeight, config_.tenBit);
     if (!pyrowave_) {

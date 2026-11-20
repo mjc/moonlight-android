@@ -72,8 +72,10 @@ void PyrowaveDecoder::lockQueue(void* userdata) {
 
 void PyrowaveDecoder::unlockQueue(void* userdata) {
     auto* decoder = static_cast<PyrowaveDecoder*>(userdata);
-    decoder->queueHeldNs_ += nowNs() - decoder->queueLockedNs_;
-    decoder->queueHolds_++;
+    if (decoder->queueSubmitTimingEnabled_) {
+        decoder->queueHeldNs_ += nowNs() - decoder->queueLockedNs_;
+        decoder->queueHolds_++;
+    }
     decoder->info_.queueMutex->unlock();
 }
 
@@ -492,6 +494,8 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     waitedNs_ = 0;
     queueHeldNs_ = 0;
     queueHolds_ = 0;
+    queueSubmitTimingEnabled_ = info_.traceRecording != nullptr &&
+                                info_.traceRecording->load(std::memory_order_relaxed);
     spanCopyUsed_ = 0;
     // The previous frame's pointers are dead. A slot that geometric growth left over one
     // frame is dropped here, before this frame pushes.
