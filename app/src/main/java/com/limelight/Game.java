@@ -979,7 +979,44 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
         }
 
-        if (prefConfig.stretchVideo || aspectRatioMatch) {
+        Point appSize = new Point(0, 0);
+        display.getSize(appSize);
+        int panelWidth = appSize.x;
+        int panelHeight = appSize.y;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Display.Mode panel = display.getMode();
+            panelWidth = panel.getPhysicalWidth();
+            panelHeight = panel.getPhysicalHeight();
+        }
+        // The window can stay at 1080p on a 4K panel. A buffer that follows the
+        // window is scaled down from the stream, then the panel scales that
+        // window back up. Size the buffer to the panel.
+        boolean panelLargerThanWindow = appSize.x > 0 && appSize.y > 0 &&
+                (panelWidth > appSize.x + 1 || panelHeight > appSize.y + 1);
+
+        if (panelLargerThanWindow && prefConfig.height > 0) {
+            int bufferWidth = panelWidth;
+            int bufferHeight = panelHeight;
+            if (!prefConfig.stretchVideo) {
+                streamView.setDesiredAspectRatio((double)prefConfig.width / (double)prefConfig.height);
+                double streamAspect = (double)prefConfig.width / (double)prefConfig.height;
+                if (panelWidth > panelHeight * streamAspect) {
+                    bufferHeight = panelHeight;
+                    bufferWidth = (int)Math.round(panelHeight * streamAspect);
+                }
+                else {
+                    bufferWidth = panelWidth;
+                    bufferHeight = (int)Math.round(panelWidth / streamAspect);
+                }
+                bufferWidth &= ~1;
+                bufferHeight &= ~1;
+            }
+            LimeLog.info("Rendering surface "+bufferWidth+"x"+bufferHeight+
+                    " for panel "+panelWidth+"x"+panelHeight+
+                    " (window "+appSize.x+"x"+appSize.y+")");
+            streamView.getHolder().setFixedSize(bufferWidth, bufferHeight);
+        }
+        else if (prefConfig.stretchVideo || aspectRatioMatch) {
             // Set the surface to the size of the video
             streamView.getHolder().setFixedSize(prefConfig.width, prefConfig.height);
         }
