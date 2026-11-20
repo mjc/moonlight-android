@@ -1365,7 +1365,8 @@ void VulkanRenderer::onImageAvailable() {
         prioritized = true;
         raiseThreadPriority("image reader");
     }
-    if (imageReaderTid_.exchange(gettid()) != gettid()) {
+    const pid_t imageReaderTid = gettid();
+    if (imageReaderTid_.exchange(imageReaderTid) != imageReaderTid) {
         perfHint_.addThread();
     }
     for (;;) {
@@ -2512,7 +2513,7 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
         std::lock_guard<std::mutex> lock(latencyMutex_);
         countLatency(captureLatency_.presented, presentedNs - frame->originNs, frame->originSynced);
     }
-    if (presentId != 0) {
+    if (presentId != 0 && traceRecording_.load(std::memory_order_relaxed)) {
         const int64_t queuedNs = nowNs();
         std::lock_guard<std::mutex> lock(mutex_);
         trace_.rendered(presentId, startNs, fencedNs, acquiredNs, queuedNs, imageIndex, fenceWaited, releasedNs);
