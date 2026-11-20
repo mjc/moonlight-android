@@ -241,26 +241,28 @@ Java_com_limelight_binding_video_VulkanRendererBridge_nativeSubmitPyrowaveFrame(
     }
     // Offset and length pairs of the parts of a partial frame that didn't arrive
     static thread_local std::vector<vkr::PyrowaveDecoder::Gap> gaps;
+    static thread_local std::vector<jint> gapRanges;
     gaps.clear();
     if (missingRanges) {
         const jsize count = env->GetArrayLength(missingRanges) / 2;
-        std::vector<jint> ranges(static_cast<size_t>(count) * 2);
-        env->GetIntArrayRegion(missingRanges, 0, count * 2, ranges.data());
+        gapRanges.resize(static_cast<size_t>(count) * 2);
+        env->GetIntArrayRegion(missingRanges, 0, count * 2, gapRanges.data());
         for (jsize i = 0; i < count; i++) {
-            if (ranges[i * 2] >= 0 && ranges[i * 2 + 1] > 0) {
-                gaps.push_back({static_cast<size_t>(ranges[i * 2]), static_cast<size_t>(ranges[i * 2 + 1])});
+            if (gapRanges[i * 2] >= 0 && gapRanges[i * 2 + 1] > 0) {
+                gaps.push_back({static_cast<size_t>(gapRanges[i * 2]), static_cast<size_t>(gapRanges[i * 2 + 1])});
             }
         }
     }
 
     // In record framing, the offsets where records start in it
     static thread_local std::vector<size_t> recordStarts;
+    static thread_local std::vector<jint> recordStartOffsetsCopy;
     recordStarts.clear();
     if (recordStartOffsets) {
         const jsize count = env->GetArrayLength(recordStartOffsets);
-        std::vector<jint> offsets(static_cast<size_t>(count));
-        env->GetIntArrayRegion(recordStartOffsets, 0, count, offsets.data());
-        for (jint offset : offsets) {
+        recordStartOffsetsCopy.resize(static_cast<size_t>(count));
+        env->GetIntArrayRegion(recordStartOffsets, 0, count, recordStartOffsetsCopy.data());
+        for (jint offset : recordStartOffsetsCopy) {
             if (offset >= 0) {
                 recordStarts.push_back(static_cast<size_t>(offset));
             }
