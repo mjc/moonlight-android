@@ -249,6 +249,11 @@
             android:summary="@string/summary_video_format"
             android:defaultValue="auto" />
         <CheckBoxPreference
+            android:key="checkbox_pyrowave_gpu_boost"
+            android:title="@string/title_pyrowave_gpu_boost"
+            android:summary="@string/summary_pyrowave_gpu_boost"
+            android:defaultValue="false" />
+        <CheckBoxPreference
             android:key="checkbox_enable_hdr"
             android:title="@string/title_enable_hdr"
             android:summary="@string/summary_enable_hdr"

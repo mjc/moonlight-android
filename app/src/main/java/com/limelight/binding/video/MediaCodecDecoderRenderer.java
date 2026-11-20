@@ -733,7 +733,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 null,
                 null,
                 false,
-                true);
+                prefs.pyrowaveGpuBoost);
         if (vulkanRenderer == null) {
             LimeLog.severe("PyroWave decoding failed to start");
             return -1;
