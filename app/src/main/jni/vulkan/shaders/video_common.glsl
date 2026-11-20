@@ -43,10 +43,7 @@ vec3 pqToSdr(vec3 e) {
     // Extended Reinhard on luminance, with the content peak mapped to SDR white
     float white = pc.params.w;
     float l = dot(lin, vec3(0.2126, 0.7152, 0.0722));
-    if (l > 0.0) {
-        float lt = l * (1.0 + l / (white * white)) / (1.0 + l);
-        lin *= lt / l;
-    }
+    lin *= (1.0 + l / (white * white)) / (1.0 + l);
 
     return pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));
 }
