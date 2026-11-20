@@ -714,6 +714,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         float displayRefreshHz = activity.getWindowManager().getDefaultDisplay().getRefreshRate();
+        java.io.File traceDirectory = activity.getExternalFilesDir("pacer-trace");
         vulkanRenderer = VulkanRendererBridge.create(
                 renderTarget.getSurface(),
                 initialWidth,
@@ -731,7 +732,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 displayRefreshHz,
                 "pyrowave",
                 null,
-                null,
+                traceDirectory == null ? null : traceDirectory.getAbsolutePath(),
                 false,
                 prefs.pyrowaveGpuBoost);
         if (vulkanRenderer == null) {
