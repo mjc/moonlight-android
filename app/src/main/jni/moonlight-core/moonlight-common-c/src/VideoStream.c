@@ -395,11 +395,11 @@ static int64_t checkPartialFrameDeadline(void) {
     }
 
     nowUs = PltGetMicroseconds();
-    RtpvCheckPartialFrameDeadline(&rtpQueue, nowUs);
-
-    if (RtpvGetPartialFrameDeadline(&rtpQueue, &deadlineUs) && nowUs < deadlineUs) {
+    if (nowUs < deadlineUs) {
         return (int64_t)(deadlineUs - nowUs);
     }
+
+    RtpvCheckPartialFrameDeadline(&rtpQueue, nowUs);
     return -1;
 }
 
