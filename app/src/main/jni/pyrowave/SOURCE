@@ -1,2 +1,2 @@
-7fe0e2667cd3076b8b2bf04bcb80bc8d691b800b Port shader quality fixes to Metal
+a433c7eb9a4c8269a283167631dead4a534c5696 Skip final compute iDWT barrier
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
