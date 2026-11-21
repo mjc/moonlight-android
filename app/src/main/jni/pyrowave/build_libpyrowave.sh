@@ -4,9 +4,8 @@
 # updating PyroWave. The Vulkan renderer loads the library at runtime, so the codec just isn't
 # offered where it's missing.
 #
-#   PYROWAVE_DIR  PyroWave checkout, with Granite checked out by its checkout_granite.sh (run it
-#                 again after pulling PyroWave, which pins the Granite commit it needs)
-#                 (default: a pyrowave folder next to this repository's folder)
+#   PYROWAVE_DIR  PyroWave checkout (default: upstream/ in this folder). Granite is checked out
+#                 at the revision pinned by PyroWave's checkout_granite.sh.
 #   ANDROID_NDK   NDK to build with (default: the version app/build.gradle uses, in ANDROID_HOME
 #                 or the default SDK location)
 #   NINJA         ninja executable, if it isn't on the PATH
@@ -19,8 +18,20 @@ cd "$(dirname "$0")"
 HERE=$(pwd)
 REPO=$(cd ../../../../.. && pwd)
 
-PYROWAVE_DIR=${PYROWAVE_DIR:-$REPO/../pyrowave}
+USE_PINNED_SOURCE=0
+if [ -z "${PYROWAVE_DIR:-}" ]; then
+    PYROWAVE_DIR=$HERE/upstream
+    USE_PINNED_SOURCE=1
+fi
+if [ ! -e "$PYROWAVE_DIR/.git" ]; then
+    echo "PyroWave source missing at $PYROWAVE_DIR; run git submodule update --init app/src/main/jni/pyrowave/upstream" >&2
+    exit 1
+fi
 PYROWAVE_DIR=$(cd "$PYROWAVE_DIR" && pwd)
+
+if [ "$USE_PINNED_SOURCE" = 1 ]; then
+    (cd "$PYROWAVE_DIR" && ./checkout_granite.sh)
+fi
 
 NDK_VERSION=$(sed -n 's/.*ndkVersion "\(.*\)".*/\1/p' "$REPO/app/build.gradle")
 if [ -z "$ANDROID_NDK" ]; then

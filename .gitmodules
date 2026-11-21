@@ -1,0 +1,3 @@
+[submodule "app/src/main/jni/pyrowave/upstream"]
+	path = app/src/main/jni/pyrowave/upstream
+	url = https://github.com/Themaister/pyrowave.git
