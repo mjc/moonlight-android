@@ -36,7 +36,7 @@ static bool receivedFullFrame;
 
 // Pull short packet bursts from Android's UDP receive queue with one syscall.
 #ifdef __ANDROID__
-#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 8
+#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 16
 #else
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
 #endif
