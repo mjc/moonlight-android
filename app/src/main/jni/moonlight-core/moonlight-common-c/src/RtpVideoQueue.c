@@ -16,6 +16,14 @@
 
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
+#define VIDEO_PACKET_FREE_BATCH_SIZE 16
+
+static void flushPacketFreeBatch(void** packets, int* packetCount) {
+    if (*packetCount != 0) {
+        videoPacketFreeBatch(packets, *packetCount);
+        *packetCount = 0;
+    }
+}
 
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
     reed_solomon_init();
@@ -26,21 +34,18 @@ void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
 }
 
 static void purgeListEntries(PRTPV_QUEUE_LIST list) {
-    void* packets[16];
+    void* packets[VIDEO_PACKET_FREE_BATCH_SIZE];
     int packetCount = 0;
 
     while (list->head != NULL) {
         PRTPV_QUEUE_ENTRY entry = list->head;
         list->head = entry->next;
         packets[packetCount++] = entry->packet;
-        if (packetCount == (int)(sizeof(packets) / sizeof(packets[0]))) {
-            videoPacketFreeBatch(packets, packetCount);
-            packetCount = 0;
+        if (packetCount == VIDEO_PACKET_FREE_BATCH_SIZE) {
+            flushPacketFreeBatch(packets, &packetCount);
         }
     }
-    if (packetCount != 0) {
-        videoPacketFreeBatch(packets, packetCount);
-    }
+    flushPacketFreeBatch(packets, &packetCount);
 
     list->tail = NULL;
     list->count = 0;
@@ -474,6 +479,8 @@ cleanup:
 
 static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
     unsigned int nextSeqNum = queue->bufferLowestSequenceNumber;
+    void* packets[VIDEO_PACKET_FREE_BATCH_SIZE];
+    int packetCount = 0;
 
     while (queue->pendingFecBlockList.count > 0) {
         PRTPV_QUEUE_ENTRY entry = queue->pendingFecBlockList.head;
@@ -495,7 +502,10 @@ static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
                 removeEntryFromList(&queue->pendingFecBlockList, parityEntry);
 
                 // Free the entry and packet
-                videoPacketFree(parityEntry->packet);
+                packets[packetCount++] = parityEntry->packet;
+                if (packetCount == VIDEO_PACKET_FREE_BATCH_SIZE) {
+                    flushPacketFreeBatch(packets, &packetCount);
+                }
 
                 continue;
             }
@@ -531,6 +541,8 @@ static void stageCompleteFecBlock(PRTP_VIDEO_QUEUE queue) {
             nextSeqNum = U16(nextSeqNum + 1);
         }
     }
+
+    flushPacketFreeBatch(packets, &packetCount);
 }
 
 static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
@@ -585,6 +597,9 @@ static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue, bool late) {
         return false;
     }
 
+    void* packets[VIDEO_PACKET_FREE_BATCH_SIZE];
+    int packetCount = 0;
+
     unsigned int i = 0;
     while (queue->completedFecBlockList.head != NULL) {
         PRTPV_QUEUE_ENTRY entry = queue->completedFecBlockList.head;
@@ -603,9 +618,13 @@ static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue, bool late) {
             shards[completedCount + index] = entry;
         }
         else {
-            videoPacketFree(entry->packet);
+            packets[packetCount++] = entry->packet;
+            if (packetCount == VIDEO_PACKET_FREE_BATCH_SIZE) {
+                flushPacketFreeBatch(packets, &packetCount);
+            }
         }
     }
+    flushPacketFreeBatch(packets, &packetCount);
 
     // Unless the current block is the frame's last, the rest of the frame never arrived
     bool endsFrame = pendingDataCount != 0 && queue->multiFecCurrentBlockNumber == queue->multiFecLastBlockNumber;
