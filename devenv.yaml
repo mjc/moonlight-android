@@ -1,0 +1,21 @@
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/d5cc6833999746cffdfe0598f7bc801a57b887a9
+
+nixpkgs:
+  android_sdk:
+    accept_license: true
+  permitted_unfree_packages:
+    - android-sdk-cmdline-tools
+    - cmdline-tools
+    - android-sdk-build-tools
+    - android-sdk-emulator
+    - build-tools
+    - android-sdk-ndk
+    - ndk
+    - android-sdk-platform-tools
+    - android-sdk-platforms
+    - android-sdk-tools
+    - platforms
+    - platform-tools
+    - tools
