@@ -188,6 +188,13 @@ struct PyrowaveBytes {
         if (end < offset) {
             return nullptr;
         }
+        if (spanIndex < spanCount) {
+            const PyrowaveSpan& span = spans[spanIndex];
+            if (span.length != 0 && span.data != nullptr && offset >= span.offset &&
+                    offset - span.offset <= span.length && length <= span.length - (offset - span.offset)) {
+                return span.data + (offset - span.offset);
+            }
+        }
         while (spanIndex < spanCount) {
             const PyrowaveSpan& span = spans[spanIndex];
             const size_t spanEnd = span.offset + span.length;
@@ -505,6 +512,7 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
     using namespace pyrowave_bitstream;
     const size_t size = frame.size;
     uint8_t headerScratch[kHeaderSize];
+    size_t headerSpanIndex = 0;
 
     PyrowaveGapScanner gapScanner {gaps, gapCount};
     const auto missing = [&](size_t begin, size_t end) { return gapScanner.overlaps(begin, end); };
@@ -540,7 +548,7 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
             continue;
         }
 
-        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch);
+        const uint8_t* hdr = frame.at(pos, kHeaderSize, headerScratch, headerSpanIndex);
         if (!hdr) {
             flush();
             pos = resync(pos);
