@@ -30,7 +30,11 @@ fi
 PYROWAVE_DIR=$(cd "$PYROWAVE_DIR" && pwd)
 
 if [ "$USE_PINNED_SOURCE" = 1 ]; then
-    (cd "$PYROWAVE_DIR" && ./checkout_granite.sh)
+    GRANITE_COMMIT=$(sed -n 's/^GRANITE_COMMIT=//p' "$PYROWAVE_DIR/checkout_granite.sh")
+    CURRENT_GRANITE_COMMIT=$(git -C "$PYROWAVE_DIR/Granite" rev-parse HEAD 2>/dev/null || true)
+    if [ "$CURRENT_GRANITE_COMMIT" != "$GRANITE_COMMIT" ]; then
+        (cd "$PYROWAVE_DIR" && ./checkout_granite.sh)
+    fi
 fi
 
 NDK_VERSION=$(sed -n 's/.*ndkVersion "\(.*\)".*/\1/p' "$REPO/app/build.gradle")
