@@ -550,6 +550,10 @@ static void VideoReceiveThreadProc(void* context) {
     char* encryptedBuffers[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
     char* buffer;
     char* encryptedBuffer;
+#ifdef __ANDROID__
+    struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
+    struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
+#endif
     int queueStatus;
     bool useSelect;
     int waitingForVideoMs;
@@ -583,6 +587,14 @@ static void VideoReceiveThreadProc(void* context) {
         }
     }
 
+#ifdef __ANDROID__
+    for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+        vectors[i].iov_len = receiveSize;
+        messages[i].msg_hdr.msg_iov = &vectors[i];
+        messages[i].msg_hdr.msg_iovlen = 1;
+    }
+#endif
+
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
@@ -602,13 +614,8 @@ static void VideoReceiveThreadProc(void* context) {
         int64_t untilDeadlineUs = checkPartialFrameDeadline();
         int receivedCount = 0;
 #ifdef __ANDROID__
-        struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
-        struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
         for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
             vectors[i].iov_base = encrypted ? encryptedBuffers[i] : buffers[i];
-            vectors[i].iov_len = receiveSize;
-            messages[i].msg_hdr.msg_iov = &vectors[i];
-            messages[i].msg_hdr.msg_iovlen = 1;
         }
 
         if (untilDeadlineUs >= 0 || useSelect) {
