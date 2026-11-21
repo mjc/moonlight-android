@@ -143,6 +143,7 @@ void initializeVideoStream(void);
 void destroyVideoStream(void);
 void* videoPacketAlloc(void);
 void videoPacketFree(void* packet);
+void videoPacketFreeBatch(void** packets, int count);
 void notifyKeyFrameReceived(void);
 int startVideoStream(void* rendererContext, int drFlags);
 void stopVideoStream(void);

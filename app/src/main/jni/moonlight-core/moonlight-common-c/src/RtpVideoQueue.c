@@ -26,10 +26,20 @@ void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
 }
 
 static void purgeListEntries(PRTPV_QUEUE_LIST list) {
+    void* packets[16];
+    int packetCount = 0;
+
     while (list->head != NULL) {
         PRTPV_QUEUE_ENTRY entry = list->head;
         list->head = entry->next;
-        videoPacketFree(entry->packet);
+        packets[packetCount++] = entry->packet;
+        if (packetCount == (int)(sizeof(packets) / sizeof(packets[0]))) {
+            videoPacketFreeBatch(packets, packetCount);
+            packetCount = 0;
+        }
+    }
+    if (packetCount != 0) {
+        videoPacketFreeBatch(packets, packetCount);
     }
 
     list->tail = NULL;
