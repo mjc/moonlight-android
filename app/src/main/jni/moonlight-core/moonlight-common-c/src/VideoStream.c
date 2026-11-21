@@ -260,7 +260,11 @@ void videoPacketFree(void* packet) {
 
 void videoPacketFreeBatch(void** packets, int count) {
     int i;
-    bool hasPoolPackets = false;
+    int poolPacketCount = 0;
+
+    if (packets == NULL || count <= 0) {
+        return;
+    }
 
     // Keep ordinary allocations out of the pool lock. Queue purges commonly
     // return several pool packets at once, so link those with one lock hold.
@@ -269,23 +273,21 @@ void videoPacketFreeBatch(void** packets, int count) {
             continue;
         }
         if (videoPacketIsPoolSlot(packets[i])) {
-            hasPoolPackets = true;
+            packets[poolPacketCount++] = packets[i];
         }
         else {
             free(packets[i]);
         }
     }
 
-    if (!hasPoolPackets) {
+    if (poolPacketCount == 0) {
         return;
     }
 
     PltLockMutex(&videoPacketPoolLock);
-    for (i = 0; i < count; i++) {
-        if (videoPacketIsPoolSlot(packets[i])) {
-            memcpy(packets[i], &videoPacketFreeHead, sizeof(videoPacketFreeHead));
-            videoPacketFreeHead = packets[i];
-        }
+    for (i = 0; i < poolPacketCount; i++) {
+        memcpy(packets[i], &videoPacketFreeHead, sizeof(videoPacketFreeHead));
+        videoPacketFreeHead = packets[i];
     }
     PltUnlockMutex(&videoPacketPoolLock);
 }
