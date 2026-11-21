@@ -63,6 +63,7 @@ env -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
 LIBS=$HERE/lib/arm64-v8a
 mkdir -p "$LIBS"
 "$STRIP" --strip-unneeded -o "$LIBS/libpyrowave-shared.so" "$BUILD/libpyrowave-shared.so"
+chmod 644 "$LIBS/libpyrowave-shared.so"
 cp "$PYROWAVE_DIR/pyrowave.h" pyrowave.h
 
 # Which PyroWave (and Granite) these came from
