@@ -713,6 +713,22 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return -1;
         }
 
+        // PyroWave decodes in Vulkan: unpaced mailbox (MinLatency) and unanchored vsync
+        // pacing (Balanced) drift across SurfaceFlinger's latch cutoff whenever host and
+        // display clocks differ, dropping frames in bursts. Route them through HostTimed
+        // pacing with FIFO + VK_GOOGLE_display_timing so clock drift resolves as a single
+        // clean adjustment per cycle.
+        int vulkanFramePacing = prefs.framePacing;
+        int vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_BALANCED;
+        if (vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_MIN_LATENCY) {
+            vulkanFramePacing = PreferenceConfiguration.FRAME_PACING_HOST_TIMED;
+            vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_LOW_LATENCY;
+        }
+        else if (vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
+            vulkanFramePacing = PreferenceConfiguration.FRAME_PACING_HOST_TIMED;
+            vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_BALANCED;
+        }
+
         float displayRefreshHz = activity.getWindowManager().getDefaultDisplay().getRefreshRate();
         java.io.File traceDirectory = activity.getExternalFilesDir("pacer-trace");
         vulkanRenderer = VulkanRendererBridge.create(
@@ -720,8 +736,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 initialWidth,
                 initialHeight,
                 refreshRate,
-                prefs.framePacing,
-                1,
+                vulkanFramePacing,
+                vulkanJitterBuffer,
                 0,
                 getPreferredColorSpace(),
                 getPreferredColorRange() == MoonBridge.COLOR_RANGE_FULL,

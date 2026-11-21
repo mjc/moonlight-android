@@ -117,6 +117,10 @@ public class PreferenceConfiguration {
     public static final int FRAME_PACING_BALANCED = 1;
     public static final int FRAME_PACING_CAP_FPS = 2;
     public static final int FRAME_PACING_MAX_SMOOTHNESS = 3;
+    public static final int FRAME_PACING_HOST_TIMED = 4;
+
+    public static final int JITTER_BUFFER_LOW_LATENCY = 0;
+    public static final int JITTER_BUFFER_BALANCED = 1;
 
     public static final String RES_360P = "640x360";
     public static final String RES_480P = "854x480";
