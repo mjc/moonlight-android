@@ -3,7 +3,6 @@
   packages = [
     pkgs.cmake
     pkgs.ninja
-    pkgs.jdk17
   ];
 
   android = {
