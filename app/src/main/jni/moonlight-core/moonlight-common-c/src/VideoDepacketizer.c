@@ -125,11 +125,20 @@ void initializeVideoDepacketizer(int pktSize) {
 // Free the NAL chain
 static void cleanupFrameState(void) {
     PLENTRY_INTERNAL lastEntry;
+    void* packets[VIDEO_PACKET_FREE_BATCH_SIZE];
+    int packetCount = 0;
 
     while (nalChainHead != NULL) {
         lastEntry = (PLENTRY_INTERNAL)nalChainHead;
         nalChainHead = lastEntry->entry.next;
-        videoPacketFree(lastEntry->allocPtr);
+        packets[packetCount++] = lastEntry->allocPtr;
+        if (packetCount == VIDEO_PACKET_FREE_BATCH_SIZE) {
+            videoPacketFreeBatch(packets, packetCount);
+            packetCount = 0;
+        }
+    }
+    if (packetCount != 0) {
+        videoPacketFreeBatch(packets, packetCount);
     }
 
     nalChainTail = NULL;
@@ -330,6 +339,8 @@ void LiWakeWaitForVideoFrame(void) {
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
     PQUEUED_DECODE_UNIT qdu = handle;
     PLENTRY_INTERNAL lastEntry;
+    void* packets[VIDEO_PACKET_FREE_BATCH_SIZE];
+    int packetCount = 0;
 
     if (drStatus == DR_NEED_IDR) {
         Limelog("Requesting IDR frame on behalf of DR\n");
@@ -344,7 +355,14 @@ void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus) {
     while (qdu->decodeUnit.bufferList != NULL) {
         lastEntry = (PLENTRY_INTERNAL)qdu->decodeUnit.bufferList;
         qdu->decodeUnit.bufferList = lastEntry->entry.next;
-        videoPacketFree(lastEntry->allocPtr);
+        packets[packetCount++] = lastEntry->allocPtr;
+        if (packetCount == VIDEO_PACKET_FREE_BATCH_SIZE) {
+            videoPacketFreeBatch(packets, packetCount);
+            packetCount = 0;
+        }
+    }
+    if (packetCount != 0) {
+        videoPacketFreeBatch(packets, packetCount);
     }
 
     // We will have stack-allocated entries iff we have a direct-submit decoder

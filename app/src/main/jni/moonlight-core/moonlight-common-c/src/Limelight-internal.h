@@ -13,6 +13,8 @@
 
 #include <enet/enet.h>
 
+#define VIDEO_PACKET_FREE_BATCH_SIZE 16
+
 // Common globals
 extern char* RemoteAddrString;
 extern struct sockaddr_storage RemoteAddr;
