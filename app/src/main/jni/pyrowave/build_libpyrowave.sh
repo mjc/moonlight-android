@@ -50,8 +50,10 @@ fi
 NINJA=${NINJA:-ninja}
 STRIP=$(ls "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-strip* | head -n 1)
 
-BUILD=$PYROWAVE_DIR/build-android-arm64
-cmake -S "$PYROWAVE_DIR" -B "$BUILD" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
+BUILD=$REPO/app/build/pyrowave-android-arm64
+env -u CMAKE_C_COMPILER_LAUNCHER -u CMAKE_CXX_COMPILER_LAUNCHER \
+    cmake -U CMAKE_C_COMPILER_LAUNCHER -U CMAKE_CXX_COMPILER_LAUNCHER \
+    -S "$PYROWAVE_DIR" -B "$BUILD" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
     -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
