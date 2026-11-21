@@ -16,7 +16,6 @@
 
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
-#define VIDEO_PACKET_FREE_BATCH_SIZE 16
 
 static void flushPacketFreeBatch(void** packets, int* packetCount) {
     if (*packetCount != 0) {
