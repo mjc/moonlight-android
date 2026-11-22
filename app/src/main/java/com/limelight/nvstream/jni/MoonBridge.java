@@ -135,8 +135,10 @@ public class MoonBridge {
     private static NvConnectionListener connectionListener;
 
     static {
-        System.loadLibrary("moonlight-core");
-        init();
+        if (!Boolean.getBoolean("moonlight.skipNativeInit")) {
+            System.loadLibrary("moonlight-core");
+            init();
+        }
     }
 
     public static int CAPABILITY_SLICES_PER_FRAME(byte slices) {
@@ -271,9 +273,9 @@ public class MoonBridge {
         }
     }
 
-    public static void bridgeArPlaySample(short[] pcmData) {
+    public static void bridgeArPlaySample(short[] pcmData, int sampleCount) {
         if (audioRenderer != null) {
-            audioRenderer.playDecodedAudio(pcmData);
+            audioRenderer.playDecodedAudio(pcmData, sampleCount);
         }
     }
 

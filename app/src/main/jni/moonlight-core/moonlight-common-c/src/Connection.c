@@ -17,6 +17,7 @@ CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
+int NegotiatedAudioConfiguration;
 volatile bool ConnectionInterrupted;
 bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
@@ -260,6 +261,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
+    NegotiatedAudioConfiguration = 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
 
@@ -289,6 +291,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         err = -1;
         goto Cleanup;
     }
+    NegotiatedAudioConfiguration = StreamConfig.audioConfiguration;
 
     // FEC only works in 16 byte chunks, so we must round down
     // the given packet size to the nearest multiple of 16.

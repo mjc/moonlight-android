@@ -526,8 +526,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         err |= addGen5Options(&optionHead);
     }
 
-    audioChannelCount = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration);
-    audioChannelMask = CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(StreamConfig.audioConfiguration);
+    int activeAudioConfig = NegotiatedAudioConfiguration != 0 ? NegotiatedAudioConfiguration : StreamConfig.audioConfiguration;
+    audioChannelCount = CHANNEL_COUNT_FROM_AUDIO_CONFIGURATION(activeAudioConfig);
+    audioChannelMask = CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(activeAudioConfig);
 
     if (AppVersionQuad[0] >= 4) {
         unsigned char slicesPerFrame;
@@ -610,7 +611,8 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
     if (AppVersionQuad[0] >= 7) {
         if (StreamConfig.bitrate >= HIGH_AUDIO_BITRATE_THRESHOLD && audioChannelCount > 2 &&
-                HighQualitySurroundSupported && (AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) == 0) {
+                HighQualitySurroundSupported && (AudioCallbacks.capabilities & CAPABILITY_SLOW_OPUS_DECODER) == 0 &&
+                StreamConfig.streamingRemotely != STREAM_CFG_REMOTE) {
             // Enable high quality mode for surround sound
             err |= addAttributeString(&optionHead, "x-nv-audio.surround.AudioQuality", "1");
 

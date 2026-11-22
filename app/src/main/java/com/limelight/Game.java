@@ -121,6 +121,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private boolean displayedFailureDialog = false;
     private boolean connecting = false;
     private boolean connected = false;
+    private boolean recreating = false;
     private boolean autoEnterPip = false;
     private boolean surfaceCreated = false;
     private boolean attemptedConnection = false;
@@ -603,6 +604,90 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
     }
 
+    static boolean hasAudioConfigChanged(PreferenceConfiguration currentPrefs, PreferenceConfiguration newPrefs) {
+        if (currentPrefs == null || newPrefs == null) {
+            return false;
+        }
+        if (currentPrefs.audioConfiguration == null) {
+            if (newPrefs.audioConfiguration != null) {
+                return true;
+            }
+        } else if (!currentPrefs.audioConfiguration.equals(newPrefs.audioConfiguration)) {
+            return true;
+        }
+        return currentPrefs.enableAudioFx != newPrefs.enableAudioFx;
+    }
+
+    static boolean hasStreamConfigChanged(PreferenceConfiguration currentPrefs, PreferenceConfiguration newPrefs) {
+        if (currentPrefs == null || newPrefs == null) {
+            return false;
+        }
+        return hasAudioConfigChanged(currentPrefs, newPrefs) ||
+                currentPrefs.width != newPrefs.width ||
+                currentPrefs.height != newPrefs.height ||
+                currentPrefs.fps != newPrefs.fps ||
+                currentPrefs.bitrate != newPrefs.bitrate ||
+                currentPrefs.videoFormat != newPrefs.videoFormat ||
+                currentPrefs.enableHdr != newPrefs.enableHdr ||
+                currentPrefs.playHostAudio != newPrefs.playHostAudio ||
+                currentPrefs.enableSops != newPrefs.enableSops ||
+                currentPrefs.fullRange != newPrefs.fullRange ||
+                currentPrefs.stretchVideo != newPrefs.stretchVideo;
+    }
+
+    static boolean hasStreamTargetChanged(Intent currentIntent, Intent newIntent) {
+        if (currentIntent == null || newIntent == null) {
+            return false;
+        }
+        String currentHost = currentIntent.getStringExtra(EXTRA_HOST);
+        String newHost = newIntent.getStringExtra(EXTRA_HOST);
+        boolean hostChanged = (currentHost == null) ? (newHost != null) : !currentHost.equals(newHost);
+        return hostChanged ||
+                currentIntent.getIntExtra(EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT) !=
+                        newIntent.getIntExtra(EXTRA_PORT, NvHTTP.DEFAULT_HTTP_PORT) ||
+                currentIntent.getIntExtra(EXTRA_HTTPS_PORT, 0) !=
+                        newIntent.getIntExtra(EXTRA_HTTPS_PORT, 0) ||
+                currentIntent.getIntExtra(EXTRA_APP_ID, StreamConfiguration.INVALID_APP_ID) !=
+                        newIntent.getIntExtra(EXTRA_APP_ID, StreamConfiguration.INVALID_APP_ID) ||
+                currentIntent.getBooleanExtra(EXTRA_APP_HDR, false) !=
+                        newIntent.getBooleanExtra(EXTRA_APP_HDR, false);
+    }
+
+    private void reconnectWithUpdatedConfig() {
+        if (isFinishing() || recreating) {
+            return;
+        }
+
+        recreating = true;
+        displayedFailureDialog = true;
+        stopConnection();
+        recreate();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+
+        if (intent == null) {
+            return;
+        }
+
+        if (intent.getIntExtra(EXTRA_APP_ID, StreamConfiguration.INVALID_APP_ID) == StreamConfiguration.INVALID_APP_ID) {
+            return;
+        }
+
+        PreferenceConfiguration newPrefs = PreferenceConfiguration.readPreferences(this);
+        boolean targetChanged = hasStreamTargetChanged(getIntent(), intent);
+        boolean configChanged = hasStreamConfigChanged(prefConfig, newPrefs);
+
+        setIntent(intent);
+
+        if (targetChanged || configChanged) {
+            LimeLog.info("Reconnecting stream due to updated intent or preferences in singleTask Game");
+            reconnectWithUpdatedConfig();
+        }
+    }
+
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
@@ -634,6 +719,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 UiHelper.notifyStreamEnteringPiP(this);
             }
             else {
+                boolean wasInPip = isHidingOverlays;
                 isHidingOverlays = false;
 
                 // Restore overlays to previous state when leaving PiP
@@ -653,6 +739,14 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 // Update GameManager state to indicate we're out of PiP (gaming, non-interruptible)
                 UiHelper.notifyStreamExitingPiP(this);
+
+                if (wasInPip) {
+                    PreferenceConfiguration newPrefs = PreferenceConfiguration.readPreferences(this);
+                    if (hasStreamConfigChanged(prefConfig, newPrefs)) {
+                        LimeLog.info("Reconnecting stream due to updated preferences after exiting PiP");
+                        reconnectWithUpdatedConfig();
+                    }
+                }
             }
         }
     }
@@ -1091,7 +1185,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     protected void onPause() {
-        if (isFinishing()) {
+        if (isFinishing() || recreating) {
             // Stop any further input device notifications before we lose focus (and pointer capture)
             if (controllerHandler != null) {
                 controllerHandler.stop();
@@ -1121,7 +1215,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             displayedFailureDialog = true;
             stopConnection();
 
-            if (prefConfig.enableLatencyToast) {
+            if (!recreating && prefConfig.enableLatencyToast) {
                 int averageEndToEndLat = decoderRenderer.getAverageEndToEndLatency();
                 int averageDecoderLat = decoderRenderer.getAverageDecoderLatency();
                 String message = null;
@@ -1168,7 +1262,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
 
             // Clear the tombstone count if we terminated normally
-            if (!reportedCrash && tombstonePrefs.getInt("CrashCount", 0) != 0) {
+            if (!recreating && !reportedCrash && tombstonePrefs.getInt("CrashCount", 0) != 0) {
                 tombstonePrefs.edit()
                         .putInt("CrashCount", 0)
                         .putInt("LastNotifiedCrashCount", 0)
@@ -1176,7 +1270,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
         }
 
-        finish();
+        if (!recreating) {
+            finish();
+        }
     }
 
     private void setInputGrabState(boolean grab) {
@@ -2289,6 +2385,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                connecting = false;
                 if (spinner != null) {
                     spinner.dismiss();
                     spinner = null;
@@ -2542,6 +2639,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         if (!attemptedConnection) {
             attemptedConnection = true;
+            connecting = true;
 
             // Update GameManager state to indicate we're "loading" while connecting
             UiHelper.notifyStreamConnecting(Game.this);
@@ -2603,7 +2701,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             // Let the decoder know immediately that the surface is gone
             decoderRenderer.prepareForStop();
 
-            if (connected) {
+            if (connecting || connected) {
                 stopConnection();
             }
         }

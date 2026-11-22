@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <limits.h>
 #include <pthread.h>
 #include <string.h>
 
@@ -13,6 +14,10 @@
 
 static OpusMSDecoder* Decoder;
 static OPUS_MULTISTREAM_CONFIGURATION OpusConfig;
+static int DecodedAudioMaxSamplesPerFrame;
+
+// Opus packets can contain up to 120 ms of audio (5760 samples/ch at 48 kHz).
+#define MAX_OPUS_DECODE_SAMPLES_PER_FRAME (48 * 120)
 
 static JavaVM *JVM;
 static pthread_key_t JniEnvKey;
@@ -140,7 +145,7 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
     BridgeArStartMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArStart", "()V");
     BridgeArStopMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArStop", "()V");
     BridgeArCleanupMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArCleanup", "()V");
-    BridgeArPlaySampleMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArPlaySample", "([S)V");
+    BridgeArPlaySampleMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeArPlaySample", "([SI)V");
     BridgeClStageStartingMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClStageStarting", "(I)V");
     BridgeClStageCompleteMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClStageComplete", "(I)V");
     BridgeClStageFailedMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClStageFailed", "(II)V");
@@ -160,6 +165,7 @@ int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* 
 
     err = (*env)->CallStaticIntMethod(env, GlobalBridgeClass, BridgeDrSetupMethod, videoFormat, width, height, redrawRate);
     if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
         // This is called on a Java thread, so it's safe to return
         return -1;
     }
@@ -168,7 +174,26 @@ int BridgeDrSetup(int videoFormat, int width, int height, int redrawRate, void* 
     }
 
     // Use a 32K frame buffer that will increase if needed
-    DecodedFrameBuffer = (*env)->NewGlobalRef(env, (*env)->NewByteArray(env, 32768));
+    jbyteArray localFrameBuffer = (*env)->NewByteArray(env, 32768);
+    if (localFrameBuffer == NULL) {
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrCleanupMethod);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return -1;
+    }
+    DecodedFrameBuffer = (*env)->NewGlobalRef(env, localFrameBuffer);
+    (*env)->DeleteLocalRef(env, localFrameBuffer);
+    if (DecodedFrameBuffer == NULL) {
+        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrCleanupMethod);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return -1;
+    }
 
     return 0;
 }
@@ -188,9 +213,15 @@ void BridgeDrStop(void) {
 void BridgeDrCleanup(void) {
     JNIEnv* env = GetThreadEnv();
 
-    (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
+    if (DecodedFrameBuffer != NULL) {
+        (*env)->DeleteGlobalRef(env, DecodedFrameBuffer);
+        DecodedFrameBuffer = NULL;
+    }
 
     (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeDrCleanupMethod);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
 }
 
 int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
@@ -285,16 +316,31 @@ int BridgeDrSubmitDecodeUnit(PDECODE_UNIT decodeUnit) {
     }
 }
 
+static void cleanupJavaAudioRenderer(JNIEnv* env) {
+    (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeArCleanupMethod);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
+}
+
 int BridgeArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int flags) {
     JNIEnv* env = GetThreadEnv();
     int err;
 
     err = (*env)->CallStaticIntMethod(env, GlobalBridgeClass, BridgeArInitMethod, audioConfiguration, opusConfig->sampleRate, opusConfig->samplesPerFrame);
     if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
         // This is called on a Java thread, so it's safe to return
         err = -1;
     }
     if (err == 0) {
+        if (opusConfig->channelCount <= 0 ||
+                opusConfig->channelCount > AUDIO_CONFIGURATION_MAX_CHANNEL_COUNT ||
+                opusConfig->samplesPerFrame <= 0) {
+            cleanupJavaAudioRenderer(env);
+            return -1;
+        }
+
         memcpy(&OpusConfig, opusConfig, sizeof(*opusConfig));
         Decoder = opus_multistream_decoder_create(opusConfig->sampleRate,
                                                   opusConfig->channelCount,
@@ -303,12 +349,41 @@ int BridgeArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusCon
                                                   opusConfig->mapping,
                                                   &err);
         if (Decoder == NULL) {
-            (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeArCleanupMethod);
+            cleanupJavaAudioRenderer(env);
             return -1;
         }
 
-        // We know ahead of time what the buffer size will be for decoded audio, so pre-allocate it
-        DecodedAudioBuffer = (*env)->NewGlobalRef(env, (*env)->NewShortArray(env, opusConfig->channelCount * opusConfig->samplesPerFrame));
+        int maxSamplesPerFrame = opusConfig->samplesPerFrame > MAX_OPUS_DECODE_SAMPLES_PER_FRAME
+                ? opusConfig->samplesPerFrame
+                : MAX_OPUS_DECODE_SAMPLES_PER_FRAME;
+        if (maxSamplesPerFrame > INT_MAX / opusConfig->channelCount) {
+            opus_multistream_decoder_destroy(Decoder);
+            Decoder = NULL;
+            cleanupJavaAudioRenderer(env);
+            return -1;
+        }
+
+        jshortArray localAudioBuffer = (*env)->NewShortArray(env, opusConfig->channelCount * maxSamplesPerFrame);
+        if (localAudioBuffer == NULL) {
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+            }
+            opus_multistream_decoder_destroy(Decoder);
+            Decoder = NULL;
+            cleanupJavaAudioRenderer(env);
+            return -1;
+        }
+
+        DecodedAudioBuffer = (*env)->NewGlobalRef(env, localAudioBuffer);
+        (*env)->DeleteLocalRef(env, localAudioBuffer);
+        if (DecodedAudioBuffer == NULL) {
+            opus_multistream_decoder_destroy(Decoder);
+            Decoder = NULL;
+            cleanupJavaAudioRenderer(env);
+            return -1;
+        }
+
+        DecodedAudioMaxSamplesPerFrame = maxSamplesPerFrame;
     }
 
     return err;
@@ -329,29 +404,46 @@ void BridgeArStop(void) {
 void BridgeArCleanup() {
     JNIEnv* env = GetThreadEnv();
 
-    opus_multistream_decoder_destroy(Decoder);
+    if (Decoder != NULL) {
+        opus_multistream_decoder_destroy(Decoder);
+        Decoder = NULL;
+    }
 
-    (*env)->DeleteGlobalRef(env, DecodedAudioBuffer);
+    if (DecodedAudioBuffer != NULL) {
+        (*env)->DeleteGlobalRef(env, DecodedAudioBuffer);
+        DecodedAudioBuffer = NULL;
+    }
 
-    (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeArCleanupMethod);
+    DecodedAudioMaxSamplesPerFrame = 0;
+
+    cleanupJavaAudioRenderer(env);
 }
 
 void BridgeArDecodeAndPlaySample(char* sampleData, int sampleLength) {
+    if (Decoder == NULL || DecodedAudioBuffer == NULL) {
+        return;
+    }
+
     JNIEnv* env = GetThreadEnv();
-
     jshort* decodedData = (*env)->GetPrimitiveArrayCritical(env, DecodedAudioBuffer, NULL);
+    if (decodedData == NULL) {
+        return;
+    }
 
+    int maxFrameSize = (sampleData == NULL) ? OpusConfig.samplesPerFrame : DecodedAudioMaxSamplesPerFrame;
     int decodeLen = opus_multistream_decode(Decoder,
                                             (const unsigned char*)sampleData,
                                             sampleLength,
                                             decodedData,
-                                            OpusConfig.samplesPerFrame,
+                                            maxFrameSize,
                                             0);
     if (decodeLen > 0) {
+        int sampleCount = decodeLen * OpusConfig.channelCount;
+
         // We must release the array elements before making further JNI calls
         (*env)->ReleasePrimitiveArrayCritical(env, DecodedAudioBuffer, decodedData, 0);
 
-        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeArPlaySampleMethod, DecodedAudioBuffer);
+        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeArPlaySampleMethod, DecodedAudioBuffer, sampleCount);
         if ((*env)->ExceptionCheck(env)) {
             // We will crash here
             (*JVM)->DetachCurrentThread(JVM);
