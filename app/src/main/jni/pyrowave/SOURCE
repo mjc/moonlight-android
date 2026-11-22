@@ -1,2 +1,2 @@
-55a0bed824254e4f93a34b5493d782b1d25d74d1 Restore coalesced idwt.comp and dwt_common.h to fix Maxwell register spill
+0a1f1f2bde553aa9f2bbc0e4235b7c77d3af20a9 Honor configured iDWT storage precision
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
