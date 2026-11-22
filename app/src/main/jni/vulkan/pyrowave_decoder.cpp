@@ -512,11 +512,12 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     // Each frame arrives on its own, so anything left from an earlier one is stale
     api.decoderClear(decoder_);
 
-    const auto push = [&](size_t offset, size_t length) { return pushFrameBytes(frame, offset, length); };
+    const PyrowaveBytes effectiveFrame = coalesceSpans(frame, partial);
+    const auto push = [&](size_t offset, size_t length) { return pushFrameBytes(effectiveFrame, offset, length); };
     if (partial != Partial::None) {
         const bool pushed = recordStarts
-                ? pushArrivedRecords(frame, gaps, gapCount, recordStarts->data(), recordStarts->size(), push)
-                : pushPartialFrame(frame, gaps, gapCount);
+                ? pushArrivedRecords(effectiveFrame, gaps, gapCount, recordStarts->data(), recordStarts->size(), push)
+                : pushPartialFrame(effectiveFrame, gaps, gapCount);
         if (!pushed) {
             partialDropped_++;
             return nullptr;
@@ -525,8 +526,8 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     else {
         // Without padding records, that's the whole frame in one go
         pyrowave_result result = PYROWAVE_SUCCESS;
-        const bool pushed = pushRecords(frame, [&](size_t offset, size_t length) {
-            if (!pushFrameBytes(frame, offset, length)) {
+        const bool pushed = pushRecords(effectiveFrame, [&](size_t offset, size_t length) {
+            if (!pushFrameBytes(effectiveFrame, offset, length)) {
                 result = PYROWAVE_ERROR_INVALID_ARGUMENT;
                 return false;
             }
@@ -850,6 +851,73 @@ VkResult PyrowaveDecoder::waitDecoded(uint64_t value, uint64_t timeoutNs) {
     return result;
 }
 
+PyrowaveBytes PyrowaveDecoder::coalesceSpans(const PyrowaveBytes& frame, Partial partial) {
+    if (frame.spanCount <= 1 || frame.spans == nullptr || frame.size == 0 || frame.size > kMaxPyrowaveFrameBytes) {
+        return frame;
+    }
+
+    bool hasAdjacent = false;
+    bool fullContiguous = true;
+    size_t expectedOffset = 0;
+    for (size_t i = 0; i < frame.spanCount; i++) {
+        const PyrowaveSpan& span = frame.spans[i];
+        if (span.length == 0 || span.data == nullptr || span.offset > frame.size ||
+                span.length > frame.size - span.offset || span.offset < expectedOffset) {
+            return frame;
+        }
+        if (span.offset != expectedOffset) {
+            fullContiguous = false;
+        }
+        else if (i > 0) {
+            hasAdjacent = true;
+        }
+        expectedOffset = span.offset + span.length;
+    }
+    if (expectedOffset != frame.size) {
+        fullContiguous = false;
+    }
+    if (!hasAdjacent) {
+        return frame;
+    }
+    if (partial == Partial::None && !fullContiguous) {
+        return frame;
+    }
+
+    constexpr size_t kFrameBufferTrimThreshold = 4u * 1024u * 1024u;
+    if (frameBufferCapacity_ < frame.size ||
+            (frameBufferCapacity_ > kFrameBufferTrimThreshold && frame.size <= kFrameBufferTrimThreshold)) {
+        frameBuffer_.reset(new uint8_t[frame.size]);
+        frameBufferCapacity_ = frame.size;
+    }
+    uint8_t* dst = frameBuffer_.get();
+
+    if (partial == Partial::None) {
+        for (size_t i = 0; i < frame.spanCount; i++) {
+            const PyrowaveSpan& span = frame.spans[i];
+            memcpy(dst + span.offset, span.data, span.length);
+        }
+        return {dst, frame.size, nullptr, 0};
+    }
+
+    mergedSpans_.clear();
+    size_t runStart = frame.spans[0].offset;
+    size_t runEnd = runStart;
+    for (size_t i = 0; i < frame.spanCount; i++) {
+        const PyrowaveSpan& span = frame.spans[i];
+        memcpy(dst + span.offset, span.data, span.length);
+        if (span.offset == runEnd) {
+            runEnd += span.length;
+        }
+        else {
+            mergedSpans_.push_back({runStart, dst + runStart, runEnd - runStart});
+            runStart = span.offset;
+            runEnd = span.offset + span.length;
+        }
+    }
+    mergedSpans_.push_back({runStart, dst + runStart, runEnd - runStart});
+    return {nullptr, frame.size, mergedSpans_.data(), mergedSpans_.size()};
+}
+
 bool PyrowaveDecoder::pushPartialFrame(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount) {
     return pushArrivedBlocks(frame, gaps, gapCount, width_, height_, lostBlocks_, [&](size_t offset, size_t length) {
         return pushFrameBytes(frame, offset, length);
@@ -860,11 +928,13 @@ bool PyrowaveDecoder::pushFrameBytes(const PyrowaveBytes& frame, size_t offset, 
     if (length == 0) {
         return true;
     }
-    if (frame.oneSpan(offset, length, spanPushIndex_)) {
-        const uint8_t* bytes = frame.at(offset, length, nullptr, spanPushIndex_);
-        if (!bytes) {
+    if (frame.spanCount == 0) {
+        if (frame.data == nullptr || offset > frame.size || length > frame.size - offset) {
             return false;
         }
+        return api.decoderPushPacket(decoder_, frame.data + offset, length) == PYROWAVE_SUCCESS;
+    }
+    if (const uint8_t* bytes = frame.at(offset, length, nullptr, spanPushIndex_)) {
         return api.decoderPushPacket(decoder_, bytes, length) == PYROWAVE_SUCCESS;
     }
     if (length > kMaxPyrowaveFrameBytes) {

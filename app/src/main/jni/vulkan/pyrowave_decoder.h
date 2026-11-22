@@ -4,7 +4,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -325,14 +324,21 @@ private:
         size_t capacity = 0;
     };
     // One buffer per run that crosses spans. Earlier pushes keep their buffers until decode_gpu_buffer returns.
-    std::deque<SpanCopy> spanCopies_;
+    std::vector<SpanCopy> spanCopies_;
     size_t spanCopyUsed_ = 0;
     size_t spanCopyCapacity_ = 0;
     size_t spanPushIndex_ = 0;
+    // Coalesces adjacent packet spans into a single cached buffer so each contiguous run takes one push.
+    std::unique_ptr<uint8_t[]> frameBuffer_;
+    size_t frameBufferCapacity_ = 0;
+    std::vector<PyrowaveSpan> mergedSpans_;
 
     // Made as needed, up to kMaxPlanes
     std::mutex poolMutex_;
     std::vector<std::unique_ptr<PyrowavePlanes>> planes_;
+
+    // Coalesces adjacent spans in frame into frameBuffer_ / mergedSpans_ when beneficial.
+    PyrowaveBytes coalesceSpans(const PyrowaveBytes& frame, Partial partial);
 
     // Pushes the blocks of a frame that arrived whole, skipping the gaps
     bool pushPartialFrame(const PyrowaveBytes& frame, const Gap* gaps, size_t gapCount);

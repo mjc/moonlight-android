@@ -284,8 +284,13 @@ bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size
     using namespace pyrowave_bitstream;
     const size_t size = frame.size;
     uint8_t headerScratch[kHeaderSize];
+    size_t headerSpanIndex = 0;
+    size_t runSpanIndex = 0;
     // Stack scratch only when an 8-byte header crosses a span. The caller uses it before the next read.
     const auto headerAt = [&](size_t offset) -> const uint8_t* {
+        return frame.at(offset, kHeaderSize, headerScratch, headerSpanIndex);
+    };
+    const auto probeHeaderAt = [&](size_t offset) -> const uint8_t* {
         return frame.at(offset, kHeaderSize, headerScratch);
     };
 
@@ -320,7 +325,7 @@ bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size
             if (!headerArrived(offset)) {
                 continue;
             }
-            const uint8_t* hdr = headerAt(offset);
+            const uint8_t* hdr = probeHeaderAt(offset);
             if (!hdr) {
                 continue;
             }
@@ -332,7 +337,7 @@ bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size
             if (next + kHeaderSize > size || !headerArrived(next)) {
                 return offset;
             }
-            const uint8_t* nextHdr = headerAt(next);
+            const uint8_t* nextHdr = probeHeaderAt(next);
             if (!nextHdr) {
                 return offset;
             }
@@ -362,7 +367,7 @@ bool pushArrivedBlocks(const PyrowaveBytes& frame, const PyrowaveGap* gaps, size
     const auto extend = [&](size_t begin, size_t end) {
         // A run stays inside one span. A block that itself crosses is pushed on its own; the
         // caller copies that block. With no spans, oneSpan is true and runs stay coalesced.
-        if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart)) {
+        if (runStart != SIZE_MAX && !frame.oneSpan(runStart, end - runStart, runSpanIndex)) {
             flush();
         }
         if (runStart == SIZE_MAX) {
@@ -446,6 +451,43 @@ template <typename Push>
 bool pushRecords(const PyrowaveBytes& frame, Push push) {
     using namespace pyrowave_bitstream;
     const size_t size = frame.size;
+    if (frame.spanCount == 0) {
+        const uint8_t* data = frame.data;
+        if (data == nullptr) {
+            return size == 0;
+        }
+        size_t runStart = 0;
+        size_t pos = 0;
+        while (pos < size) {
+            if (size - pos < kHeaderSize) {
+                return false;
+            }
+            uint32_t first;
+            memcpy(&first, data + pos, sizeof(first));
+            if (first == 0xFFFFFFFFu) {
+                uint32_t words;
+                memcpy(&words, data + pos + 4, sizeof(words));
+                if (pos > runStart && !push(runStart, pos - runStart)) {
+                    return false;
+                }
+                if (words > (size - pos - kHeaderSize) / 4) {
+                    return false;
+                }
+                pos += kHeaderSize + 4 * static_cast<size_t>(words);
+                runStart = pos;
+                continue;
+            }
+
+            const bool frameHeader = (first >> 31) != 0;
+            const size_t length = frameHeader ? kHeaderSize : 4 * static_cast<size_t>((first >> 16) & 0xFFFu);
+            if (length < kHeaderSize || length > size - pos) {
+                return false;
+            }
+            pos += length;
+        }
+        return pos == runStart || push(runStart, pos - runStart);
+    }
+
     uint8_t headerScratch[kHeaderSize];
     size_t headerSpanIndex = 0;
 
@@ -476,14 +518,17 @@ bool pushRecords(const PyrowaveBytes& frame, Push push) {
             continue;
         }
 
-        const BlockHeader header = readHeader(hdr);
-        const size_t length = header.frameHeader ? kHeaderSize : 4 * static_cast<size_t>(header.payloadWords);
+        const bool frameHeader = (first >> 31) != 0;
+        const size_t length = frameHeader ? kHeaderSize : 4 * static_cast<size_t>((first >> 16) & 0xFFFu);
         if (length < kHeaderSize || length > size - pos) {
             return false;
         }
         const size_t end = pos + length;
         // Same split as pushArrivedBlocks: complete records in one span stay one push.
-        if (runStart < pos && frame.spanCount != 0) {
+        if (runStart == pos) {
+            runSpanIndex = headerSpanIndex;
+        }
+        else {
             const PyrowaveSpan& runSpan = frame.spans[runSpanIndex];
             const size_t runSpanEnd = runSpan.offset + runSpan.length;
             if (runSpanEnd < runSpan.offset || runStart < runSpan.offset || end > runSpanEnd) {
@@ -564,8 +609,8 @@ bool pushArrivedRecords(const PyrowaveBytes& frame, const PyrowaveGap* gaps, siz
             length = words <= (size - pos - kHeaderSize) / 4 ? kHeaderSize + 4 * static_cast<size_t>(words) : SIZE_MAX;
         }
         else {
-            const BlockHeader header = readHeader(hdr);
-            length = header.frameHeader ? kHeaderSize : 4 * static_cast<size_t>(header.payloadWords);
+            const bool frameHeader = (first >> 31) != 0;
+            length = frameHeader ? kHeaderSize : 4 * static_cast<size_t>((first >> 16) & 0xFFFu);
         }
         if (length < kHeaderSize || length > size - pos) {
             // Not a record, or it runs past what arrived of the frame

@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "pyrowave_submit.h"
@@ -11,6 +12,21 @@ using vkr::RendererConfig;
 using vkr::VulkanRenderer;
 
 namespace {
+
+constexpr size_t kContiguousTrimThreshold = 4u * 1024u * 1024u;
+
+struct ContiguousBuffer {
+    std::unique_ptr<uint8_t[]> data;
+    size_t capacity = 0;
+
+    uint8_t* ensure(size_t size) {
+        if (capacity < size || (capacity > kContiguousTrimThreshold && size <= kContiguousTrimThreshold)) {
+            data.reset(new uint8_t[size]);
+            capacity = size;
+        }
+        return data.get();
+    }
+};
 
 // BUFFER_TYPE_MISSING entries are holes: their data pointer is null and their length is the hole.
 // RECORD_START entries are picture bytes that begin a record. The logical frame is fullLength
@@ -27,7 +43,12 @@ extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) 
     }
 
     const size_t fullLength = static_cast<size_t>(decodeUnit->fullLength);
-    static thread_local std::vector<uint8_t> contiguous;
+    vkr::PyrowaveDecoder::Partial partial = vkr::PyrowaveDecoder::Partial::None;
+    if (decodeUnit->partialFrame) {
+        partial = decodeUnit->partialLate ? vkr::PyrowaveDecoder::Partial::Cut : vkr::PyrowaveDecoder::Partial::Lost;
+    }
+
+    static thread_local ContiguousBuffer contiguous;
     static thread_local std::vector<vkr::PyrowaveSpan> spans;
     static thread_local std::vector<vkr::PyrowaveDecoder::Gap> gaps;
     static thread_local std::vector<size_t> recordStarts;
@@ -35,62 +56,83 @@ extern "C" int submitPyrowaveDecodeUnit(PDECODE_UNIT decodeUnit, void* context) 
     gaps.clear();
     recordStarts.clear();
 
-    size_t offset = 0;
-    for (PLENTRY entry = decodeUnit->bufferList; entry != nullptr; entry = entry->next) {
-        if (entry->length <= 0) {
-            __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entry has length %d", entry->length);
-            return DR_OK;
-        }
-        const size_t length = static_cast<size_t>(entry->length);
-        if (offset > fullLength || length > fullLength - offset) {
-            __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entries run past the frame");
-            return DR_OK;
-        }
-        const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
-        if (missing) {
-            gaps.push_back({offset, length});
-        }
-        else {
-            spans.push_back({offset, reinterpret_cast<const uint8_t*>(entry->data), length});
-            if (entry->bufferType == BUFFER_TYPE_RECORD_START) {
-                recordStarts.push_back(offset);
-            }
-        }
-        offset += length;
-    }
-    if (offset < fullLength) {
-        gaps.push_back({offset, fullLength - offset});
-    }
-
-    vkr::PyrowaveDecoder::Partial partial = vkr::PyrowaveDecoder::Partial::None;
-    if (decodeUnit->partialFrame) {
-        partial = decodeUnit->partialLate ? vkr::PyrowaveDecoder::Partial::Cut : vkr::PyrowaveDecoder::Partial::Lost;
-    }
-
-    vkr::PyrowaveBytes bytes;
-    // pushRecords reads every byte of a non-partial frame, including a hole filled with zeros.
-    // A span walk would skip that hole, so this case stays on the contiguous buffer.
-    if (partial == vkr::PyrowaveDecoder::Partial::None && !gaps.empty()) {
-        contiguous.resize(fullLength);
-        size_t copyAt = 0;
-        for (PLENTRY entry = decodeUnit->bufferList; entry != nullptr; entry = entry->next) {
-            const size_t length = static_cast<size_t>(entry->length);
-            const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
-            if (missing) {
-                memset(contiguous.data() + copyAt, 0, length);
-            }
-            else {
-                memcpy(contiguous.data() + copyAt, entry->data, length);
-            }
-            copyAt += length;
-        }
-        if (copyAt < fullLength) {
-            memset(contiguous.data() + copyAt, 0, fullLength - copyAt);
-        }
-        bytes = {contiguous.data(), contiguous.size(), nullptr, 0};
+    // Fast path: single buffer entry covering the whole frame requires no copy.
+    PLENTRY first = decodeUnit->bufferList;
+    vkr::PyrowaveBytes bytes {};
+    if (first->next == nullptr && partial == vkr::PyrowaveDecoder::Partial::None &&
+            first->data != nullptr && first->bufferType != BUFFER_TYPE_MISSING &&
+            first->length > 0 && static_cast<size_t>(first->length) == fullLength) {
+        bytes = {reinterpret_cast<const uint8_t*>(first->data), fullLength, nullptr, 0};
     }
     else {
-        bytes = {nullptr, fullLength, spans.empty() ? nullptr : spans.data(), spans.size()};
+        // Coalesce packet buffers into one cached array in a single pass. Complete frames become
+        // one contiguous buffer; partial frames merge consecutive arrived packets into one span
+        // per stretch between gaps so records never cross span boundaries.
+        uint8_t* dst = contiguous.ensure(fullLength);
+        size_t offset = 0;
+        size_t spanStart = 0;
+        bool inSpan = false;
+
+        for (PLENTRY entry = first; entry != nullptr; entry = entry->next) {
+            if (entry->length <= 0) {
+                __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entry has length %d", entry->length);
+                return DR_OK;
+            }
+            const size_t length = static_cast<size_t>(entry->length);
+            if (offset > fullLength || length > fullLength - offset) {
+                __android_log_print(ANDROID_LOG_WARN, "VulkanBridge", "PyroWave frame entries run past the frame");
+                return DR_OK;
+            }
+            const bool missing = entry->data == nullptr || entry->bufferType == BUFFER_TYPE_MISSING;
+            if (missing) {
+                if (partial != vkr::PyrowaveDecoder::Partial::None && inSpan) {
+                    spans.push_back({spanStart, dst + spanStart, offset - spanStart});
+                    inSpan = false;
+                }
+                if (!gaps.empty() && gaps.back().offset + gaps.back().length == offset) {
+                    gaps.back().length += length;
+                }
+                else {
+                    gaps.push_back({offset, length});
+                }
+                if (partial == vkr::PyrowaveDecoder::Partial::None) {
+                    memset(dst + offset, 0, length);
+                }
+            }
+            else {
+                memcpy(dst + offset, entry->data, length);
+                if (entry->bufferType == BUFFER_TYPE_RECORD_START) {
+                    recordStarts.push_back(offset);
+                }
+                if (partial != vkr::PyrowaveDecoder::Partial::None && !inSpan) {
+                    spanStart = offset;
+                    inSpan = true;
+                }
+            }
+            offset += length;
+        }
+        if (partial != vkr::PyrowaveDecoder::Partial::None && inSpan) {
+            spans.push_back({spanStart, dst + spanStart, offset - spanStart});
+        }
+        if (offset < fullLength) {
+            const size_t tailMissing = fullLength - offset;
+            if (!gaps.empty() && gaps.back().offset + gaps.back().length == offset) {
+                gaps.back().length += tailMissing;
+            }
+            else {
+                gaps.push_back({offset, tailMissing});
+            }
+            if (partial == vkr::PyrowaveDecoder::Partial::None) {
+                memset(dst + offset, 0, tailMissing);
+            }
+        }
+
+        if (partial == vkr::PyrowaveDecoder::Partial::None) {
+            bytes = {dst, fullLength, nullptr, 0};
+        }
+        else {
+            bytes = {nullptr, fullLength, spans.empty() ? nullptr : spans.data(), spans.size()};
+        }
     }
 
     const VulkanRenderer::PyrowaveFrameTiming timing {
