@@ -1,2 +1,2 @@
-a433c7eb9a4c8269a283167631dead4a534c5696 Skip final compute iDWT barrier
+2ba51a9a513f616facb5d6c7b56249bac329e6e4 Add UMA zero-copy payload upload and Vulkan 1.1 shader path selection
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
