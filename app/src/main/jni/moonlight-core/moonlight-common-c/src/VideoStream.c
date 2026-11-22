@@ -145,6 +145,14 @@ static void createVideoPacketPool(void) {
     int i;
     size_t bytes;
     void* head;
+    int packetCount = VIDEO_PACKET_POOL_COUNT;
+
+#ifdef __ANDROID__
+    // Unencrypted receive slots lend their packet buffers to the RTP queue.
+    if (!(EncryptionFeaturesEnabled & SS_ENC_VIDEO)) {
+        packetCount += VIDEO_RECV_RING_SLOTS;
+    }
+#endif
 
     slotSize = videoPacketSlotSize();
     videoPacketBufferSize = slotSize;
@@ -152,7 +160,7 @@ static void createVideoPacketPool(void) {
         return;
     }
 
-    bytes = (size_t)VIDEO_PACKET_POOL_COUNT * (size_t)slotSize;
+    bytes = (size_t)packetCount * (size_t)slotSize;
     slab = (char*)malloc(bytes);
     if (slab == NULL) {
         Limelog("Video packet pool: malloc() failed\n");
@@ -165,7 +173,7 @@ static void createVideoPacketPool(void) {
     }
 
     head = NULL;
-    for (i = VIDEO_PACKET_POOL_COUNT - 1; i >= 0; i--) {
+    for (i = packetCount - 1; i >= 0; i--) {
         char* slot = slab + (size_t)i * (size_t)slotSize;
         memcpy(slot, &head, sizeof(head));
         head = slot;
@@ -336,6 +344,7 @@ int videoReceiveRingPayloadBytes(int packetSize) {
 
 #ifdef __ANDROID__
 typedef struct _VIDEO_RECV_RING_SLOT {
+    _Alignas(16) char* packet;
     uint64_t receivedUs;
     int length;
 } VIDEO_RECV_RING_SLOT, *PVIDEO_RECV_RING_SLOT;
@@ -346,6 +355,7 @@ typedef struct _VIDEO_RECV_RING {
     size_t slotStride;
     int receiveSize;
     int wakeupEventFd;
+    bool directPackets;
     _Alignas(64) atomic_uint_fast64_t writeIndex;
     _Alignas(64) atomic_uint_fast64_t readIndex;
     _Alignas(64) atomic_bool consumerWaiting;
@@ -363,7 +373,7 @@ static inline PVIDEO_RECV_RING_SLOT videoRecvRingSlot(uint64_t index) {
 }
 
 static inline char* videoRecvRingSlotData(PVIDEO_RECV_RING_SLOT slot) {
-    return (char*)slot + sizeof(VIDEO_RECV_RING_SLOT);
+    return slot->packet;
 }
 
 static void wakeVideoReceiveConsumer(void) {
@@ -401,12 +411,25 @@ static void destroyVideoReceiveRing(void) {
         close(videoRecvRing.wakeupEventFd);
         videoRecvRing.wakeupEventFd = -1;
     }
+    if (videoRecvRing.directPackets && videoRecvRing.slab != NULL) {
+        void* packets[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
+        int count = 0;
+        for (int i = 0; i < VIDEO_RECV_RING_SLOTS; i++) {
+            packets[count++] = videoRecvRingSlot((uint64_t)i)->packet;
+            if (count == VIDEO_PACKET_RECEIVE_BATCH_SIZE) {
+                videoPacketFreeBatch(packets, count);
+                count = 0;
+            }
+        }
+        videoPacketFreeBatch(packets, count);
+    }
     free(videoRecvRing.slab);
     videoRecvRing.slab = NULL;
     free(videoRecvRing.dropBuffer);
     videoRecvRing.dropBuffer = NULL;
     videoRecvRing.slotStride = 0;
     videoRecvRing.receiveSize = 0;
+    videoRecvRing.directPackets = false;
 }
 
 static int createVideoReceiveRing(int receiveSize) {
@@ -415,18 +438,19 @@ static int createVideoReceiveRing(int receiveSize) {
     int fd;
     char* slab;
     char* dropBuffer;
+    bool directPackets = !(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
 
     destroyVideoReceiveRing();
 
-    if (receiveSize <= 0) {
+    if (receiveSize <= 0 || (directPackets && receiveSize > videoPacketBufferSize)) {
         return -1;
     }
 
     // Align each slot to 16 bytes so headers and packet payloads stay naturally aligned.
-    stride = (sizeof(VIDEO_RECV_RING_SLOT) + (size_t)receiveSize + 15u) & ~(size_t)15u;
+    stride = (sizeof(VIDEO_RECV_RING_SLOT) + (directPackets ? 0 : (size_t)receiveSize) + 15u) & ~(size_t)15u;
     slabBytes = (size_t)VIDEO_RECV_RING_SLOTS * stride;
 
-    slab = (char*)malloc(slabBytes);
+    slab = directPackets ? (char*)calloc(1, slabBytes) : (char*)malloc(slabBytes);
     if (slab == NULL) {
         Limelog("Video receive ring: malloc(%zu) failed\n", slabBytes);
         return -1;
@@ -453,6 +477,16 @@ static int createVideoReceiveRing(int receiveSize) {
     videoRecvRing.slotStride = stride;
     videoRecvRing.receiveSize = receiveSize;
     videoRecvRing.wakeupEventFd = fd;
+    videoRecvRing.directPackets = directPackets;
+    for (int i = 0; i < VIDEO_RECV_RING_SLOTS; i++) {
+        PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((uint64_t)i);
+        slot->packet = directPackets ? (char*)videoPacketAlloc() : (char*)slot + sizeof(*slot);
+        if (slot->packet == NULL) {
+            Limelog("Video receive ring: packet allocation failed\n");
+            destroyVideoReceiveRing();
+            return -1;
+        }
+    }
     atomic_init(&videoRecvRing.writeIndex, 0);
     atomic_init(&videoRecvRing.readIndex, 0);
     atomic_init(&videoRecvRing.consumerWaiting, false);
@@ -490,6 +524,7 @@ void initializeVideoStream(void) {
     videoRecvRing.dropBuffer = NULL;
     videoRecvRing.slotStride = 0;
     videoRecvRing.receiveSize = 0;
+    videoRecvRing.directPackets = false;
     atomic_init(&videoRecvRing.writeIndex, 0);
     atomic_init(&videoRecvRing.readIndex, 0);
     atomic_init(&videoRecvRing.consumerWaiting, false);
@@ -1030,7 +1065,11 @@ static bool processAndroidRingBatch(uint64_t readIdx, int batchCount, char** buf
             }
         }
         else {
-            memcpy(buffer, slotData, (size_t)err);
+            // The producer cannot reuse this slot until readIndex is published below.
+            // Give it our spare buffer and let the RTP queue own the received packet.
+            slot->packet = buffer;
+            buffer = slotData;
+            buffers[batchIndex] = buffer;
         }
 
         // Convert fields to host byte-order
