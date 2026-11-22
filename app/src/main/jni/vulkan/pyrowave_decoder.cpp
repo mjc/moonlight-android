@@ -509,6 +509,24 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     signaledBlit_ = false;
     *times = {};
 
+    // Start draining GPU keep-busy chunks right away so they overlap packet pushing as well as
+    // command-buffer recording. Dropped before the submit: the hold ends here. Once
+    // beforeDecodeSubmit runs, that path owns the pause, including when the submit itself fails.
+    struct BoostHold {
+        void (*abandoned)(void*);
+        void* userdata;
+        bool held = false;
+        ~BoostHold() {
+            if (held && abandoned != nullptr) {
+                abandoned(userdata);
+            }
+        }
+    } boost {info_.decodeRecordAbandoned, info_.submitUserdata};
+    if (info_.beforeDecodeRecord != nullptr) {
+        info_.beforeDecodeRecord(info_.submitUserdata);
+        boost.held = true;
+    }
+
     // Each frame arrives on its own, so anything left from an earlier one is stale
     api.decoderClear(decoder_);
 
@@ -582,24 +600,6 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     }
 
     times->pushNs = nowNs() - startNs;
-
-    // Chunks already keeping the GPU busy drain while the command buffer is recorded.
-    // Dropped before the submit: the hold ends here. Once beforeDecodeSubmit runs, that
-    // path owns the pause, including when the submit itself fails.
-    struct BoostHold {
-        void (*abandoned)(void*);
-        void* userdata;
-        bool held = false;
-        ~BoostHold() {
-            if (held && abandoned != nullptr) {
-                abandoned(userdata);
-            }
-        }
-    } boost {info_.decodeRecordAbandoned, info_.submitUserdata};
-    if (info_.beforeDecodeRecord != nullptr) {
-        info_.beforeDecodeRecord(info_.submitUserdata);
-        boost.held = true;
-    }
 
     PyrowavePlanes* planes = acquirePlanes();
     if (!planes) {
