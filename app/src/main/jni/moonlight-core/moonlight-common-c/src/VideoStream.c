@@ -1,5 +1,8 @@
 #include "Limelight-internal.h"
 #ifdef __ANDROID__
+#include <limits.h>
+#include <stdatomic.h>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #endif
 
@@ -16,6 +19,9 @@ static SOCKET firstFrameSocket = INVALID_SOCKET;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
 static PLT_THREAD udpPingThread;
+#ifdef __ANDROID__
+static PLT_THREAD drainThread;
+#endif
 static PLT_THREAD receiveThread;
 static PLT_THREAD decoderThread;
 
@@ -39,7 +45,9 @@ static bool receivedFullFrame;
 
 // Pull short packet bursts from Android's UDP receive queue with one syscall.
 #ifdef __ANDROID__
-#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 32
+#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 64
+#define VIDEO_RECV_RING_SLOTS 8192
+#define VIDEO_RECV_RING_MASK (VIDEO_RECV_RING_SLOTS - 1)
 #else
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
 #endif
@@ -95,9 +103,13 @@ static uint32_t clockSyncSentSequence[CLOCK_SYNC_SENT_SLOTS];
 static uint64_t clockSyncSentUs[CLOCK_SYNC_SENT_SLOTS];
 
 // FEC window, plus the 15-frame decode queue and the block still being assembled.
-// The window is a few frames, so a second window covers the queue and that block.
-// A miss mallocs a buffer of the same size.
+// On Android, size the pool for 348 Mbps + 20% FEC (~625 packets/frame); elsewhere
+// a second window covers the queue and assembled block. A miss mallocs a buffer.
+#ifdef __ANDROID__
+#define VIDEO_PACKET_POOL_COUNT (RTP_RECV_PACKETS_BUFFERED * 3)
+#else
 #define VIDEO_PACKET_POOL_COUNT (RTP_RECV_PACKETS_BUFFERED * 2)
+#endif
 
 // The packet pointer is the start of the slot. The RTP queue entry stays at
 // packetSize + MAX_RTP_HEADER_SIZE inside it, so a free slot keeps its freelist
@@ -295,6 +307,154 @@ void videoPacketFreeBatch(void** packets, int count) {
     PltUnlockMutex(&videoPacketPoolLock);
 }
 
+int videoReceiveRingPayloadBytes(int packetSize) {
+#ifdef __ANDROID__
+    uint64_t bytes;
+
+    if (packetSize <= 0) {
+        return 0;
+    }
+
+    bytes = (uint64_t)VIDEO_RECV_RING_SLOTS * (uint64_t)packetSize;
+    if (bytes > (uint64_t)INT_MAX) {
+        return INT_MAX;
+    }
+    return (int)bytes;
+#else
+    (void)packetSize;
+    return 0;
+#endif
+}
+
+#ifdef __ANDROID__
+typedef struct _VIDEO_RECV_RING_SLOT {
+    uint64_t receivedUs;
+    int length;
+} VIDEO_RECV_RING_SLOT, *PVIDEO_RECV_RING_SLOT;
+
+typedef struct _VIDEO_RECV_RING {
+    char* slab;
+    char* dropBuffer;
+    size_t slotStride;
+    int receiveSize;
+    int wakeupEventFd;
+    _Alignas(64) atomic_uint_fast64_t writeIndex;
+    _Alignas(64) atomic_uint_fast64_t readIndex;
+    _Alignas(64) atomic_bool consumerWaiting;
+    atomic_bool stopRequested;
+    atomic_int socketError;
+    atomic_uint_fast64_t droppedPackets;
+} VIDEO_RECV_RING;
+
+static VIDEO_RECV_RING videoRecvRing = {
+    .wakeupEventFd = -1,
+};
+
+static inline PVIDEO_RECV_RING_SLOT videoRecvRingSlot(uint64_t index) {
+    return (PVIDEO_RECV_RING_SLOT)(videoRecvRing.slab + (size_t)(index & VIDEO_RECV_RING_MASK) * videoRecvRing.slotStride);
+}
+
+static inline char* videoRecvRingSlotData(PVIDEO_RECV_RING_SLOT slot) {
+    return (char*)slot + sizeof(VIDEO_RECV_RING_SLOT);
+}
+
+static void wakeVideoReceiveConsumer(void) {
+    if (videoRecvRing.wakeupEventFd >= 0) {
+        uint64_t one = 1;
+        ssize_t ignored = write(videoRecvRing.wakeupEventFd, &one, sizeof(one));
+        (void)ignored;
+    }
+}
+
+static void drainVideoReceiveWakeup(void) {
+    if (videoRecvRing.wakeupEventFd >= 0) {
+        uint64_t val;
+        ssize_t ignored = read(videoRecvRing.wakeupEventFd, &val, sizeof(val));
+        (void)ignored;
+    }
+}
+
+static void signalVideoReceiveRingError(int err) {
+    atomic_store_explicit(&videoRecvRing.socketError, err != 0 ? err : -1, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&videoRecvRing.consumerWaiting, memory_order_relaxed)) {
+        wakeVideoReceiveConsumer();
+    }
+}
+
+static void requestVideoReceiveRingStop(void) {
+    atomic_store_explicit(&videoRecvRing.stopRequested, true, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
+    wakeVideoReceiveConsumer();
+}
+
+static void destroyVideoReceiveRing(void) {
+    if (videoRecvRing.wakeupEventFd >= 0) {
+        close(videoRecvRing.wakeupEventFd);
+        videoRecvRing.wakeupEventFd = -1;
+    }
+    free(videoRecvRing.slab);
+    videoRecvRing.slab = NULL;
+    free(videoRecvRing.dropBuffer);
+    videoRecvRing.dropBuffer = NULL;
+    videoRecvRing.slotStride = 0;
+    videoRecvRing.receiveSize = 0;
+}
+
+static int createVideoReceiveRing(int receiveSize) {
+    size_t stride;
+    size_t slabBytes;
+    int fd;
+    char* slab;
+    char* dropBuffer;
+
+    destroyVideoReceiveRing();
+
+    if (receiveSize <= 0) {
+        return -1;
+    }
+
+    // Align each slot to 16 bytes so headers and packet payloads stay naturally aligned.
+    stride = (sizeof(VIDEO_RECV_RING_SLOT) + (size_t)receiveSize + 15u) & ~(size_t)15u;
+    slabBytes = (size_t)VIDEO_RECV_RING_SLOTS * stride;
+
+    slab = (char*)malloc(slabBytes);
+    if (slab == NULL) {
+        Limelog("Video receive ring: malloc(%zu) failed\n", slabBytes);
+        return -1;
+    }
+
+    dropBuffer = (char*)malloc((size_t)receiveSize);
+    if (dropBuffer == NULL) {
+        free(slab);
+        Limelog("Video receive ring: dropBuffer malloc(%d) failed\n", receiveSize);
+        return -1;
+    }
+
+    fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) {
+        int err = errno != 0 ? errno : -1;
+        free(dropBuffer);
+        free(slab);
+        Limelog("Video receive ring: eventfd() failed: %d\n", err);
+        return err;
+    }
+
+    videoRecvRing.slab = slab;
+    videoRecvRing.dropBuffer = dropBuffer;
+    videoRecvRing.slotStride = stride;
+    videoRecvRing.receiveSize = receiveSize;
+    videoRecvRing.wakeupEventFd = fd;
+    atomic_init(&videoRecvRing.writeIndex, 0);
+    atomic_init(&videoRecvRing.readIndex, 0);
+    atomic_init(&videoRecvRing.consumerWaiting, false);
+    atomic_init(&videoRecvRing.stopRequested, false);
+    atomic_init(&videoRecvRing.socketError, 0);
+    atomic_init(&videoRecvRing.droppedPackets, 0);
+    return 0;
+}
+#endif
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -316,10 +476,26 @@ void initializeVideoStream(void) {
     memset(clockSyncSentSequence, 0, sizeof(clockSyncSentSequence));
     memset(clockSyncSentUs, 0, sizeof(clockSyncSentUs));
     createVideoPacketPool();
+#ifdef __ANDROID__
+    videoRecvRing.wakeupEventFd = -1;
+    videoRecvRing.slab = NULL;
+    videoRecvRing.dropBuffer = NULL;
+    videoRecvRing.slotStride = 0;
+    videoRecvRing.receiveSize = 0;
+    atomic_init(&videoRecvRing.writeIndex, 0);
+    atomic_init(&videoRecvRing.readIndex, 0);
+    atomic_init(&videoRecvRing.consumerWaiting, false);
+    atomic_init(&videoRecvRing.stopRequested, false);
+    atomic_init(&videoRecvRing.socketError, 0);
+    atomic_init(&videoRecvRing.droppedPackets, 0);
+#endif
 }
 
 // Clean up the video stream
 void destroyVideoStream(void) {
+#ifdef __ANDROID__
+    destroyVideoReceiveRing();
+#endif
     PltDestroyCryptoContext(decryptionCtx);
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
@@ -545,6 +721,352 @@ static void VideoPingThreadProc(void* context) {
     }
 }
 
+#ifdef __ANDROID__
+static void setVideoThreadPriority(void) {
+    // Match the renderer's display-priority threads so high-bitrate UDP bursts don't
+    // stall behind normal-priority work.
+    if (setpriority(PRIO_PROCESS, 0, -8) != 0) {
+        setpriority(PRIO_PROCESS, 0, -4);
+    }
+}
+
+static bool videoDrainStopped(void) {
+    return PltIsThreadInterrupted(&drainThread) ||
+           atomic_load_explicit(&videoRecvRing.stopRequested, memory_order_acquire);
+}
+
+static bool videoReceiveStopped(void) {
+    return PltIsThreadInterrupted(&receiveThread) ||
+           atomic_load_explicit(&videoRecvRing.stopRequested, memory_order_acquire);
+}
+
+static void VideoDrainThreadProc(void* context) {
+    struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
+    struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
+    bool useSelect;
+    uint64_t lastDropLogMs = 0;
+
+    setVideoThreadPriority();
+
+    if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
+        useSelect = true;
+    }
+    else {
+        useSelect = false;
+    }
+
+    for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+        vectors[i].iov_len = (size_t)videoRecvRing.receiveSize;
+        messages[i].msg_hdr.msg_iov = &vectors[i];
+        messages[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    while (!videoDrainStopped()) {
+        uint64_t writeIdx = atomic_load_explicit(&videoRecvRing.writeIndex, memory_order_relaxed);
+        uint64_t readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
+        uint64_t used = writeIdx - readIdx;
+        int freeSlots = (used >= VIDEO_RECV_RING_SLOTS) ? 0 : (int)(VIDEO_RECV_RING_SLOTS - used);
+        int ringSlotsToFill = freeSlots < VIDEO_PACKET_RECEIVE_BATCH_SIZE ? freeSlots : VIDEO_PACKET_RECEIVE_BATCH_SIZE;
+
+        for (int i = 0; i < ringSlotsToFill; i++) {
+            PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((writeIdx + (uint64_t)i) & VIDEO_RECV_RING_MASK);
+            vectors[i].iov_base = videoRecvRingSlotData(slot);
+            messages[i].msg_len = 0;
+        }
+        for (int i = ringSlotsToFill; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+            vectors[i].iov_base = videoRecvRing.dropBuffer;
+            messages[i].msg_len = 0;
+        }
+
+        int receivedCount;
+        if (useSelect || freeSlots == 0) {
+            struct pollfd pfd;
+            int pollRet;
+
+            pfd.fd = rtpSocket;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            pollRet = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+            if (pollRet < 0) {
+                if (LastSocketError() == EINTR) {
+                    continue;
+                }
+                Limelog("Video Drain: pollSockets() failed: %d\n", (int)LastSocketError());
+                signalVideoReceiveRingError(LastSocketFail());
+                break;
+            }
+            if (pollRet == 0) {
+                continue;
+            }
+
+            if (freeSlots == 0) {
+                // Re-check whether the consumer freed slots while we waited in poll().
+                readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
+                used = writeIdx - readIdx;
+                freeSlots = (used >= VIDEO_RECV_RING_SLOTS) ? 0 : (int)(VIDEO_RECV_RING_SLOTS - used);
+                ringSlotsToFill = freeSlots < VIDEO_PACKET_RECEIVE_BATCH_SIZE ? freeSlots : VIDEO_PACKET_RECEIVE_BATCH_SIZE;
+                for (int i = 0; i < ringSlotsToFill; i++) {
+                    PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((writeIdx + (uint64_t)i) & VIDEO_RECV_RING_MASK);
+                    vectors[i].iov_base = videoRecvRingSlotData(slot);
+                    messages[i].msg_len = 0;
+                }
+            }
+
+            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_DONTWAIT, NULL);
+        }
+        else {
+            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_WAITFORONE, NULL);
+        }
+
+        if (receivedCount < 0) {
+            int sockErr = LastSocketError();
+            if (sockErr == EWOULDBLOCK || sockErr == EAGAIN || sockErr == EINTR) {
+                continue;
+            }
+            Limelog("Video Drain: recvmmsg() failed: %d\n", sockErr);
+            signalVideoReceiveRingError(LastSocketFail());
+            break;
+        }
+        if (receivedCount == 0) {
+            continue;
+        }
+
+        int accepted = receivedCount <= ringSlotsToFill ? receivedCount : ringSlotsToFill;
+        int dropped = receivedCount - accepted;
+
+        if (accepted > 0) {
+            for (int i = 0; i < accepted; i++) {
+                PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((writeIdx + (uint64_t)i) & VIDEO_RECV_RING_MASK);
+                int len = (int)messages[i].msg_len;
+                slot->length = len;
+                if (len == sizeof(SS_CLOCK_SYNC_REPLY)) {
+                    slot->receivedUs = PltGetMicroseconds();
+                }
+            }
+
+            atomic_store_explicit(&videoRecvRing.writeIndex, writeIdx + (uint64_t)accepted, memory_order_release);
+            atomic_thread_fence(memory_order_seq_cst);
+            if (atomic_load_explicit(&videoRecvRing.consumerWaiting, memory_order_relaxed)) {
+                wakeVideoReceiveConsumer();
+            }
+        }
+
+        if (dropped > 0) {
+            uint64_t totalDropped = atomic_fetch_add_explicit(&videoRecvRing.droppedPackets,
+                                                              (uint64_t)dropped,
+                                                              memory_order_relaxed) + (uint64_t)dropped;
+            uint64_t nowMs = PltGetMillis();
+            if (lastDropLogMs == 0 || nowMs - lastDropLogMs >= 1000) {
+                Limelog("Video Drain: ring full, dropped %d packets (total dropped: %llu)\n",
+                        dropped, (unsigned long long)totalDropped);
+                lastDropLogMs = nowMs;
+            }
+        }
+    }
+}
+
+static bool processAndroidRingBatch(uint64_t readIdx, int batchCount, char** buffers,
+                                    int decryptedSize, int minSize, bool encrypted,
+                                    int waitingForVideoMs, bool* fatalPacket) {
+    int consumed = 0;
+
+    *fatalPacket = false;
+    for (int batchIndex = 0; batchIndex < batchCount; batchIndex++) {
+        PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((readIdx + (uint64_t)batchIndex) & VIDEO_RECV_RING_MASK);
+        char* slotData = videoRecvRingSlotData(slot);
+        int err = slot->length;
+        char* buffer = buffers[batchIndex];
+        PRTP_PACKET packet;
+        int queueStatus;
+
+        consumed++;
+
+        // Keep deadline handling at packet granularity, even while draining a burst.
+        checkPartialFrameDeadline();
+
+        // A clock sync reply, which can't be a video packet (see SS_CLOCK_SYNC_REPLY)
+        if (err == sizeof(SS_CLOCK_SYNC_REPLY)) {
+            PSS_CLOCK_SYNC_REPLY reply = (PSS_CLOCK_SYNC_REPLY)slotData;
+
+            if (LE32(reply->magic) == SS_CLOCK_SYNC_REPLY_MAGIC) {
+                handleClockSyncReply(reply, slot->receivedUs);
+                continue;
+            }
+        }
+
+        // Every packet counts, including FEC, duplicates, and packets of frames that are
+        // later dropped
+        rtpQueue.stats.byteCountReceived += (uint32_t)err;
+        rtpQueue.stats.packetCountReceived++;
+
+        if (!receivedDataFromPeer) {
+            receivedDataFromPeer = true;
+            Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
+
+            firstDataTimeMs = PltGetMillis();
+        }
+
+#ifndef LC_FUZZING
+        if (!receivedFullFrame) {
+            if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                Limelog("Terminating connection due to lack of a successful video frame\n");
+                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                *fatalPacket = true;
+                break;
+            }
+        }
+#endif
+
+        if (err < minSize || err > videoRecvRing.receiveSize) {
+            // Runt packet
+            continue;
+        }
+
+        if (encrypted) {
+            PENC_VIDEO_HEADER encHeader = (PENC_VIDEO_HEADER)slotData;
+
+            // Discard frames older than the active queue frame before decrypting.
+            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+                continue;
+            }
+
+            if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
+                                   (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
+                                   encHeader->iv, sizeof(encHeader->iv),
+                                   encHeader->tag, sizeof(encHeader->tag),
+                                   ((unsigned char*)(encHeader + 1)), err - sizeof(ENC_VIDEO_HEADER),
+                                   (unsigned char*)buffer, &err)) {
+                Limelog("Failed to decrypt video packet!\n");
+                continue;
+            }
+        }
+        else {
+            memcpy(buffer, slotData, (size_t)err);
+        }
+
+        // Convert fields to host byte-order
+        packet = (PRTP_PACKET)&buffer[0];
+        packet->sequenceNumber = BE16(packet->sequenceNumber);
+        packet->timestamp = BE32(packet->timestamp);
+        packet->ssrc = BE32(packet->ssrc);
+
+        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+
+        if (queueStatus == RTPF_RET_QUEUED) {
+            // The queue owns the buffer
+            buffers[batchIndex] = NULL;
+        }
+    }
+
+    atomic_store_explicit(&videoRecvRing.readIndex, readIdx + (uint64_t)consumed, memory_order_release);
+    return !(*fatalPacket);
+}
+
+// Receive thread proc (consumes from the dedicated VideoDrain SPSC ring)
+static void VideoReceiveThreadProc(void* context) {
+    int decryptedSize, minSize;
+    char* buffers[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
+    int waitingForVideoMs = 0;
+    bool encrypted;
+
+    setVideoThreadPriority();
+
+    encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
+    decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
+    minSize = sizeof(RTP_PACKET) + (encrypted ? sizeof(ENC_VIDEO_HEADER) : 0);
+
+    while (!videoReceiveStopped()) {
+        int64_t untilDeadlineUs = checkPartialFrameDeadline();
+        uint64_t readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_relaxed);
+        uint64_t writeIdx = atomic_load_explicit(&videoRecvRing.writeIndex, memory_order_acquire);
+
+        if (readIdx == writeIdx) {
+            int sockErr = atomic_load_explicit(&videoRecvRing.socketError, memory_order_acquire);
+            if (sockErr != 0) {
+                ListenerCallbacks.connectionTerminated(sockErr);
+                break;
+            }
+
+            int timeoutMs = untilDeadlineUs >= 0 ? (int)((untilDeadlineUs + 999) / 1000)
+                                                 : UDP_RECV_POLL_TIMEOUT_MS;
+            if (timeoutMs > UDP_RECV_POLL_TIMEOUT_MS) {
+                timeoutMs = UDP_RECV_POLL_TIMEOUT_MS;
+            }
+
+            atomic_store_explicit(&videoRecvRing.consumerWaiting, true, memory_order_relaxed);
+            atomic_thread_fence(memory_order_seq_cst);
+
+            writeIdx = atomic_load_explicit(&videoRecvRing.writeIndex, memory_order_acquire);
+            sockErr = atomic_load_explicit(&videoRecvRing.socketError, memory_order_acquire);
+            if (readIdx == writeIdx && sockErr == 0 && !videoReceiveStopped()) {
+                struct pollfd pfd;
+                pfd.fd = videoRecvRing.wakeupEventFd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+
+                int pollRet = poll(&pfd, 1, timeoutMs);
+                atomic_store_explicit(&videoRecvRing.consumerWaiting, false, memory_order_relaxed);
+
+                if (pollRet > 0 && (pfd.revents & POLLIN)) {
+                    drainVideoReceiveWakeup();
+                }
+                else if (pollRet < 0) {
+                    if (errno != EINTR) {
+                        Limelog("Video Receive: poll(eventfd) failed: %d\n", errno);
+                        ListenerCallbacks.connectionTerminated(LastSocketFail());
+                        break;
+                    }
+                }
+                else if (pollRet == 0) {
+                    if (untilDeadlineUs < 0 && !receivedDataFromPeer) {
+                        waitingForVideoMs += timeoutMs;
+                        if (waitingForVideoMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
+                            Limelog("Terminating connection due to lack of video traffic\n");
+                            ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_TRAFFIC);
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            atomic_store_explicit(&videoRecvRing.consumerWaiting, false, memory_order_relaxed);
+            if (videoReceiveStopped()) {
+                break;
+            }
+            if (readIdx == writeIdx) {
+                if (sockErr != 0) {
+                    ListenerCallbacks.connectionTerminated(sockErr);
+                    break;
+                }
+                continue;
+            }
+        }
+
+        uint64_t avail = writeIdx - readIdx;
+        int batchCount = avail > VIDEO_PACKET_RECEIVE_BATCH_SIZE ? VIDEO_PACKET_RECEIVE_BATCH_SIZE : (int)avail;
+
+        if (!videoPacketAllocBatch(buffers, batchCount)) {
+            Limelog("Video Receive: malloc() failed\n");
+            ListenerCallbacks.connectionTerminated(-1);
+            goto cleanup;
+        }
+
+        bool fatalPacket = false;
+        if (!processAndroidRingBatch(readIdx, batchCount, buffers, decryptedSize, minSize,
+                                     encrypted, waitingForVideoMs, &fatalPacket)) {
+            break;
+        }
+    }
+
+cleanup:
+    for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
+        if (buffers[i] != NULL) {
+            videoPacketFree(buffers[i]);
+        }
+    }
+}
+#else
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
     int err;
@@ -553,22 +1075,10 @@ static void VideoReceiveThreadProc(void* context) {
     char* encryptedBuffers[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
     char* buffer;
     char* encryptedBuffer;
-#ifdef __ANDROID__
-    struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
-    struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
-#endif
     int queueStatus;
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
-
-#ifdef __ANDROID__
-    // Match the renderer's display-priority threads so high-bitrate UDP bursts don't
-    // overflow small kernel receive buffers while VideoRecv waits behind normal-priority work.
-    if (setpriority(PRIO_PROCESS, 0, -8) != 0) {
-        setpriority(PRIO_PROCESS, 0, -4);
-    }
-#endif
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -598,14 +1108,6 @@ static void VideoReceiveThreadProc(void* context) {
         }
     }
 
-#ifdef __ANDROID__
-    for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
-        vectors[i].iov_len = receiveSize;
-        messages[i].msg_hdr.msg_iov = &vectors[i];
-        messages[i].msg_hdr.msg_iovlen = 1;
-    }
-#endif
-
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
@@ -624,51 +1126,6 @@ static void VideoReceiveThreadProc(void* context) {
         // with a short SO_RCVTIMEO there often went 10 ms without returning.
         int64_t untilDeadlineUs = checkPartialFrameDeadline();
         int receivedCount = 0;
-#ifdef __ANDROID__
-        for (int i = 0; i < VIDEO_PACKET_RECEIVE_BATCH_SIZE; i++) {
-            vectors[i].iov_base = encrypted ? encryptedBuffers[i] : buffers[i];
-        }
-
-        if (untilDeadlineUs >= 0 || useSelect) {
-            struct pollfd pfd;
-            int timeoutMs = untilDeadlineUs >= 0 ? (int)((untilDeadlineUs + 999) / 1000)
-                                                 : UDP_RECV_POLL_TIMEOUT_MS;
-            if (timeoutMs > UDP_RECV_POLL_TIMEOUT_MS) {
-                timeoutMs = UDP_RECV_POLL_TIMEOUT_MS;
-            }
-            pfd.fd = rtpSocket;
-            pfd.events = POLLIN;
-
-            // Drain anything already queued without waiting past a partial-frame deadline.
-            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_DONTWAIT, NULL);
-            if (receivedCount < 0 && (LastSocketError() == EWOULDBLOCK || LastSocketError() == EAGAIN ||
-                                      LastSocketError() == EINTR)) {
-                if (pollSockets(&pfd, 1, timeoutMs) == 0) {
-                    // Nothing arrived before the deadline or receive timeout.
-                    receivedCount = 0;
-                }
-                else {
-                    receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE,
-                                             MSG_DONTWAIT, NULL);
-                }
-            }
-        }
-        else {
-            // Wait for the first datagram, then take only the rest of the current burst.
-            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_WAITFORONE, NULL);
-        }
-
-        if (receivedCount < 0) {
-            if (LastSocketError() == EWOULDBLOCK || LastSocketError() == EAGAIN || LastSocketError() == EINTR) {
-                receivedCount = 0;
-            }
-            else {
-                Limelog("Video Receive: recvmmsg() failed: %d\n", (int)LastSocketError());
-                ListenerCallbacks.connectionTerminated(LastSocketFail());
-                break;
-            }
-        }
-#else
         bool received = false;
         if (untilDeadlineUs >= 0) {
             struct pollfd pfd;
@@ -727,7 +1184,6 @@ static void VideoReceiveThreadProc(void* context) {
             // Receive timed out; try again
             continue;
         }
-#endif
 
         if (receivedCount == 0) {
             if (untilDeadlineUs < 0 && !receivedDataFromPeer) {
@@ -747,9 +1203,6 @@ static void VideoReceiveThreadProc(void* context) {
         for (int batchIndex = 0; batchIndex < receivedCount; batchIndex++) {
             buffer = buffers[batchIndex];
             encryptedBuffer = encrypted ? encryptedBuffers[batchIndex] : NULL;
-#ifdef __ANDROID__
-            err = (int)messages[batchIndex].msg_len;
-#endif
             // Keep deadline handling at packet granularity, even while draining a burst.
             checkPartialFrameDeadline();
 
@@ -858,6 +1311,7 @@ cleanup:
         free(encryptedBuffers[i]);
     }
 }
+#endif
 
 void notifyKeyFrameReceived(void) {
     // Remember that we got a full frame successfully
@@ -889,6 +1343,52 @@ int readFirstFrame(void) {
     return 0;
 }
 
+static void cleanupFailedVideoStreamStart(bool hasRecv, bool hasDrain, bool hasDec) {
+    VideoCallbacks.stop();
+    if (hasRecv || hasDec) {
+        stopVideoDepacketizer();
+    }
+#ifdef __ANDROID__
+    if (hasDrain) {
+        PltInterruptThread(&drainThread);
+    }
+    if (hasRecv || hasDrain) {
+        requestVideoReceiveRingStop();
+    }
+#else
+    (void)hasDrain;
+#endif
+    if (hasRecv) {
+        PltInterruptThread(&receiveThread);
+    }
+    if (hasDec) {
+        PltInterruptThread(&decoderThread);
+    }
+#ifdef __ANDROID__
+    if (hasDrain) {
+        PltJoinThread(&drainThread);
+    }
+#endif
+    if (hasRecv) {
+        PltJoinThread(&receiveThread);
+    }
+    if (hasDec) {
+        PltJoinThread(&decoderThread);
+    }
+#ifdef __ANDROID__
+    destroyVideoReceiveRing();
+#endif
+    if (firstFrameSocket != INVALID_SOCKET) {
+        closeSocket(firstFrameSocket);
+        firstFrameSocket = INVALID_SOCKET;
+    }
+    if (rtpSocket != INVALID_SOCKET) {
+        closeSocket(rtpSocket);
+        rtpSocket = INVALID_SOCKET;
+    }
+    VideoCallbacks.cleanup();
+}
+
 // Terminate the video stream
 void stopVideoStream(void) {
     if (!receivedDataFromPeer) {
@@ -901,6 +1401,10 @@ void stopVideoStream(void) {
     stopVideoDepacketizer();
 
     PltInterruptThread(&udpPingThread);
+#ifdef __ANDROID__
+    PltInterruptThread(&drainThread);
+    requestVideoReceiveRingStop();
+#endif
     PltInterruptThread(&receiveThread);
     if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
         PltInterruptThread(&decoderThread);
@@ -911,10 +1415,17 @@ void stopVideoStream(void) {
     }
 
     PltJoinThread(&udpPingThread);
+#ifdef __ANDROID__
+    PltJoinThread(&drainThread);
+#endif
     PltJoinThread(&receiveThread);
     if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
         PltJoinThread(&decoderThread);
     }
+
+#ifdef __ANDROID__
+    destroyVideoReceiveRing();
+#endif
 
     if (firstFrameSocket != INVALID_SOCKET) {
         closeSocket(firstFrameSocket);
@@ -951,24 +1462,40 @@ int startVideoStream(void* rendererContext, int drFlags) {
         return LastSocketError();
     }
 
+#ifdef __ANDROID__
+    {
+        int receiveSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE +
+                          ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
+        err = createVideoReceiveRing(receiveSize);
+        if (err != 0) {
+            closeSocket(rtpSocket);
+            rtpSocket = INVALID_SOCKET;
+            VideoCallbacks.cleanup();
+            return err;
+        }
+    }
+#endif
+
     VideoCallbacks.start();
 
     err = PltCreateThread("VideoRecv", VideoReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {
-        VideoCallbacks.stop();
-        closeSocket(rtpSocket);
-        VideoCallbacks.cleanup();
+        cleanupFailedVideoStreamStart(false, false, false);
         return err;
     }
+
+#ifdef __ANDROID__
+    err = PltCreateThread("VideoDrain", VideoDrainThreadProc, NULL, &drainThread);
+    if (err != 0) {
+        cleanupFailedVideoStreamStart(true, false, false);
+        return err;
+    }
+#endif
 
     if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
         err = PltCreateThread("VideoDec", VideoDecoderThreadProc, NULL, &decoderThread);
         if (err != 0) {
-            VideoCallbacks.stop();
-            PltInterruptThread(&receiveThread);
-            PltJoinThread(&receiveThread);
-            closeSocket(rtpSocket);
-            VideoCallbacks.cleanup();
+            cleanupFailedVideoStreamStart(true, true, false);
             return err;
         }
     }
@@ -978,19 +1505,10 @@ int startVideoStream(void* rendererContext, int drFlags) {
         firstFrameSocket = connectTcpSocket(&RemoteAddr, AddrLen,
                                             FIRST_FRAME_PORT, FIRST_FRAME_TIMEOUT_SEC);
         if (firstFrameSocket == INVALID_SOCKET) {
-            VideoCallbacks.stop();
-            stopVideoDepacketizer();
-            PltInterruptThread(&receiveThread);
-            if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-                PltInterruptThread(&decoderThread);
-            }
-            PltJoinThread(&receiveThread);
-            if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-                PltJoinThread(&decoderThread);
-            }
-            closeSocket(rtpSocket);
-            VideoCallbacks.cleanup();
-            return LastSocketError();
+            err = LastSocketError();
+            cleanupFailedVideoStreamStart(true, true,
+                                          (VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0);
+            return err;
         }
     }
 
@@ -998,22 +1516,8 @@ int startVideoStream(void* rendererContext, int drFlags) {
     // to send UDP data
     err = PltCreateThread("VideoPing", VideoPingThreadProc, NULL, &udpPingThread);
     if (err != 0) {
-        VideoCallbacks.stop();
-        stopVideoDepacketizer();
-        PltInterruptThread(&receiveThread);
-        if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-            PltInterruptThread(&decoderThread);
-        }
-        PltJoinThread(&receiveThread);
-        if ((VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0) {
-            PltJoinThread(&decoderThread);
-        }
-        closeSocket(rtpSocket);
-        if (firstFrameSocket != INVALID_SOCKET) {
-            closeSocket(firstFrameSocket);
-            firstFrameSocket = INVALID_SOCKET;
-        }
-        VideoCallbacks.cleanup();
+        cleanupFailedVideoStreamStart(true, true,
+                                      (VideoCallbacks.capabilities & (CAPABILITY_DIRECT_SUBMIT | CAPABILITY_PULL_RENDERER)) == 0);
         return err;
     }
 

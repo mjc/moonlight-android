@@ -143,6 +143,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative);
 
 void initializeVideoStream(void);
 void destroyVideoStream(void);
+int videoReceiveRingPayloadBytes(int packetSize);
 void* videoPacketAlloc(void);
 void videoPacketFree(void* packet);
 void videoPacketFreeBatch(void** packets, int count);
