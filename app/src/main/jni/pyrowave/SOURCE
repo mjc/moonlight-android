@@ -1,2 +1,2 @@
-785cd0854f7025a6735016aa207aef96b6caa65d Disable 2x2 packed wavelets on MoltenVK and Apple GPUs
+3581e3014238d688f32d870d33959910d4b69ed4 Optimize packed 2x2 iDWT with subgroup ballot masks and 2D interior dispatch
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
