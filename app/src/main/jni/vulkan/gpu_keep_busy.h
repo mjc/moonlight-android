@@ -75,7 +75,8 @@ private:
     // Under pauseMutex_. Submits both slots. On failure marks the thread stopped.
     bool submitPair(std::unique_lock<std::mutex>& lock);
     // Under pauseMutex_. May unlock while a blit fence is waited. False when stopping.
-    bool waitBlitGate(std::unique_lock<std::mutex>& lock);
+    // Sets *waited (when non-null) if the call unlocked to wait for a blit fence or hold.
+    bool waitBlitGate(std::unique_lock<std::mutex>& lock, bool* waited = nullptr);
     void stopRun(std::unique_lock<std::mutex>& lock);
 
     VkApi vk_;
@@ -100,8 +101,9 @@ private:
     uint32_t iterations_ = 0;
     uint32_t recordedIterations_[kInFlight] = {};
     std::atomic<bool> quit_ {false};
-    bool paused_ = false;  // Under pauseMutex_
-    int inFlight_ = 0;     // Submitted chunks not yet waited. Under pauseMutex_
+    bool paused_ = false;      // Under pauseMutex_
+    uint64_t pauseEpoch_ = 0;  // Incremented when paused_ transitions to true. Under pauseMutex_.
+    int inFlight_ = 0;         // Submitted chunks not yet waited. Under pauseMutex_
     std::mutex pauseMutex_;
     std::condition_variable pauseCv_;
     std::thread thread_;

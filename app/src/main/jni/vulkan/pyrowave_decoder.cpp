@@ -663,22 +663,47 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     const uint32_t firstQuery = static_cast<uint32_t>(2 * slotIndex);
     if (timestampPool_) {
         vk_.vkCmdResetQueryPool(cmd, timestampPool_, firstQuery, 2);
+        // TOP_OF_PIPE runs when the command buffer enters the front-end before the barrier stalls
+        // dstStage (and placing it after would not wait either, since dstStage is downstream of
+        // TOP_OF_PIPE), matching timeline_'s behavior before waitStage; callers clamp overlap.
         vk_.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampPool_, firstQuery);
     }
 
     // With our commands, PyroWave leaves synchronizing them to us: the submission below waits
     // for the decode before at the stage that writes the planes, which makes the planes' writes
     // visible to it, and the render waits for the timeline before reading them. Without a
-    // timeline, a barrier does the same for the decode before, which is ahead of this one on
-    // the queue, and the render makes the writes visible itself.
+    // timeline, a barrier synchronizes sequential decodes on this queue:
+    //   - Compute path: prior dequant+idwt wrote wavelet_img_* and planes in COMPUTE_SHADER;
+    //     next decode updates payload_data/dequant_offset_buffer in TRANSFER, then dequants and
+    //     runs idwt in COMPUTE_SHADER.
+    //   - Fragment path: prior dequant wrote wavelet_img_* in COMPUTE_SHADER, prior idwt_fragment
+    //     sampled wavelet_img_* and fragment.levels[*] in FRAGMENT_SHADER and wrote
+    //     fragment.levels[*] and planes in COLOR_ATTACHMENT_OUTPUT; next decode uploads in
+    //     TRANSFER, dequants in COMPUTE_SHADER, and runs idwt_fragment in COLOR_ATTACHMENT_OUTPUT
+    //     (FRAGMENT_SHADER is ordered after those stages by PyroWave's internal barriers).
     const VkPipelineStageFlags waitStage = fragmentPath_ ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
                                                          : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     if (!timeline_) {
         VkMemoryBarrier barrier {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        vk_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, waitStage, 0, 1, &barrier, 0, nullptr,
-                                 0, nullptr);
+        VkPipelineStageFlags srcStage;
+        VkPipelineStageFlags dstStage;
+        if (fragmentPath_) {
+            srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                       VK_PIPELINE_STAGE_TRANSFER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        }
+        else {
+            srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                    VK_ACCESS_TRANSFER_WRITE_BIT;
+        }
+        vk_.vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
     }
     if (ownDevice()) {
         recordOwnership(cmd, *planes, true);

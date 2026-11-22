@@ -52,6 +52,7 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
     {
         std::lock_guard<std::mutex> lock(pauseMutex_);
         paused_ = false;
+        pauseEpoch_ = 0;
         inFlight_ = 0;
         blitGeneration_ = 0;
         blitWaitedGeneration_ = 0;
@@ -84,6 +85,7 @@ void GpuKeepBusy::requestPause() {
         return;
     }
     paused_ = true;
+    pauseEpoch_++;
     pauseCv_.notify_all();
 }
 
@@ -94,6 +96,7 @@ void GpuKeepBusy::pause() {
     }
     if (!paused_) {
         paused_ = true;
+        pauseEpoch_++;
         pauseCv_.notify_all();
     }
     pauseCv_.wait(lock, [this] { return quit_.load() || inFlight_ == 0; });
@@ -169,7 +172,7 @@ bool GpuKeepBusy::submitPair(std::unique_lock<std::mutex>& lock) {
     return true;
 }
 
-bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock) {
+bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock, bool* waited) {
     for (;;) {
         if (quit_) {
             return false;
@@ -178,6 +181,9 @@ bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock) {
             return true;
         }
         if (blitWait_ && blitFence_ != VK_NULL_HANDLE && blitGeneration_ != blitWaitedGeneration_) {
+            if (waited) {
+                *waited = true;
+            }
             const uint64_t generation = blitGeneration_;
             const VkFence fence = blitFence_;
             const VkDevice device = blitDevice_;
@@ -214,6 +220,9 @@ bool GpuKeepBusy::waitBlitGate(std::unique_lock<std::mutex>& lock) {
             continue;
         }
         if (unarmedBlits_ > 0) {
+            if (waited) {
+                *waited = true;
+            }
             pauseCv_.wait(lock, [this] { return quit_.load() || paused_ || unarmedBlits_ == 0; });
             continue;
         }
@@ -535,11 +544,18 @@ void GpuKeepBusy::run() {
 
     // Two dispatches in flight, so the GPU has the next one when one ends. With nothing else to
     // run, they end a chunk apart; the quickest of them are sized to chunkNs_.
+    // Only uncontended back-to-back intervals (chunk 2+ in an uninterrupted, unpaused run) are
+    // sampled so post-pause startup latency and decode/blit contention cannot shrink iterations_.
     std::vector<int64_t> intervals;
     intervals.reserve(kSizingWindow);
     int64_t lastDoneNs = nowNs();
+    int64_t windowStartNs = lastDoneNs;
     int64_t statsStartNs = lastDoneNs;
+    int64_t lastQuickestNs = 0;
     uint64_t chunks = 0;
+    uint64_t runEpoch = 0;
+    bool steadyRun = false;
+    bool calibrated = false;
     int slot = 0;
     while (!quit_) {
         {
@@ -552,7 +568,8 @@ void GpuKeepBusy::run() {
                 if (paused_) {
                     continue;
                 }
-                lastDoneNs = nowNs();
+                steadyRun = false;
+                runEpoch = pauseEpoch_;
                 if (!submitPair(lock)) {
                     return;
                 }
@@ -568,28 +585,82 @@ void GpuKeepBusy::run() {
             return;
         }
         const int64_t now = nowNs();
-        intervals.push_back(now - lastDoneNs);
-        lastDoneNs = now;
         chunks++;
+
+        bool uncontended = false;
+        {
+            std::lock_guard<std::mutex> lock(pauseMutex_);
+            uncontended = !paused_ && !quit_ && pauseEpoch_ == runEpoch;
+            if (!uncontended) {
+                runEpoch = pauseEpoch_;
+            }
+        }
+
+        if (uncontended) {
+            if (steadyRun) {
+                if (intervals.empty()) {
+                    windowStartNs = lastDoneNs;
+                }
+                intervals.push_back(now - lastDoneNs);
+            }
+            lastDoneNs = now;
+            steadyRun = true;
+        }
+        else {
+            steadyRun = false;
+        }
 
         if (intervals.size() >= kSizingWindow) {
             const auto quickest = intervals.begin() + intervals.size() / 4;
             std::nth_element(intervals.begin(), quickest, intervals.end());
             const int64_t chunkNs = std::max<int64_t>(*quickest, 1);
-            const double scale = std::clamp(static_cast<double>(chunkNs_) / static_cast<double>(chunkNs), 0.25, 4.0);
-            // Ignore small timing jitter so steady-state command buffers stay cached without re-recording.
-            if (scale < 0.92 || scale > 1.08) {
-                iterations_ = static_cast<uint32_t>(std::clamp(iterations_ * scale, static_cast<double>(kMinIterations),
-                                                               static_cast<double>(kMaxIterations)));
+            lastQuickestNs = chunkNs;
+            const double rawScale = static_cast<double>(chunkNs_) / static_cast<double>(chunkNs);
+            const int64_t windowDurationNs = now - windowStartNs;
+            const bool sparseSlow = calibrated && windowDurationNs >= 1'000'000'000LL && chunkNs > 2 * chunkNs_;
+
+            if (rawScale >= 0.85 && rawScale <= 1.15) {
+                calibrated = true;
             }
-            if (now - statsStartNs >= kStatsIntervalNs) {
-                ALOGI("Kept the GPU busy: %llu chunks in %.1f s, the quickest quarter %lld us or quicker, now %u iterations",
-                      static_cast<unsigned long long>(chunks), (now - statsStartNs) / 1e9,
-                      static_cast<long long>(chunkNs / 1000), iterations_);
-                statsStartNs = now;
-                chunks = 0;
+
+            // Ignore small timing jitter so steady-state command buffers stay cached without re-recording.
+            if (!sparseSlow && (rawScale < 0.92 || rawScale > 1.08)) {
+                double stepScale;
+                if (!calibrated) {
+                    stepScale = std::clamp(rawScale, 0.25, 4.0);
+                }
+                else {
+                    const double clamped = std::clamp(rawScale, 0.5, 2.0);
+                    stepScale = 1.0 + 0.5 * (clamped - 1.0);
+                }
+                const uint32_t nextIterations = static_cast<uint32_t>(std::clamp(
+                        static_cast<double>(iterations_) * stepScale,
+                        static_cast<double>(kMinIterations),
+                        static_cast<double>(kMaxIterations)));
+                if (nextIterations != iterations_) {
+                    iterations_ = nextIterations;
+                    steadyRun = false;
+                }
+                if (iterations_ == kMinIterations || iterations_ == kMaxIterations) {
+                    calibrated = true;
+                }
             }
             intervals.clear();
+        }
+
+        if (now - statsStartNs >= kStatsIntervalNs) {
+            if (lastQuickestNs > 0) {
+                ALOGI("Kept the GPU busy: %llu chunks in %.1f s, the quickest quarter %lld us or quicker, now %u iterations",
+                      static_cast<unsigned long long>(chunks), (now - statsStartNs) / 1e9,
+                      static_cast<long long>(lastQuickestNs / 1000), iterations_);
+            }
+            else {
+                ALOGI("Kept the GPU busy: %llu chunks in %.1f s, calibrating (%zu/%zu samples), now %u iterations",
+                      static_cast<unsigned long long>(chunks), (now - statsStartNs) / 1e9,
+                      intervals.size(), kSizingWindow, iterations_);
+            }
+            statsStartNs = now;
+            chunks = 0;
         }
 
         if (recordedIterations_[slot] != iterations_ && !recordSlot(slot, iterations_)) {
@@ -616,8 +687,12 @@ void GpuKeepBusy::run() {
                 slot = (slot + 1) % kInFlight;
                 continue;
             }
-            if (!waitBlitGate(lock)) {
+            bool blitWaited = false;
+            if (!waitBlitGate(lock, &blitWaited)) {
                 return;
+            }
+            if (blitWaited) {
+                steadyRun = false;
             }
             if (paused_ || quit_) {
                 slot = (slot + 1) % kInFlight;
