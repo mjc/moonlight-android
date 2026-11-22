@@ -1,2 +1,2 @@
-8b7d935f9c3bd5187e8fbfbef3c99c096d30ee63 Remove redundant iDWT apron barrier
+48d49ec864ea50619dc1fe952f4d08f015feda10 Reuse bitplane masks for dequantized coefficient signs
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
