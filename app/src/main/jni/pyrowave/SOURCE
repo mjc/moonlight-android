@@ -1,2 +1,2 @@
-48d49ec864ea50619dc1fe952f4d08f015feda10 Reuse bitplane masks for dequantized coefficient signs
+cde4ac19e9793b11e9410c9b80dcc875a6446422 Pack 2x2 wavelet quads in RGBA and classify sparse iDWT workgroups
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
