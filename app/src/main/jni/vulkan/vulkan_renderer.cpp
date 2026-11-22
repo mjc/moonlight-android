@@ -1471,15 +1471,21 @@ bool VulkanRenderer::submitPyrowaveFrame(const PyrowaveBytes& frameBytes, const 
     }
     int64_t originNs = 0;
     bool originSynced = false;
+    int64_t queuedNs = 0;
+    int64_t commonToLocalNs = 0;
+    uint32_t rttMs = 0;
+    const bool recordTiming = timing && traceRecording_.load(std::memory_order_relaxed);
     if (timing) {
-        int64_t queuedNs = 0;
-        int64_t commonToLocalNs = 0;
         const FrameOrigin origin = frameOrigin(hostPtsNs, timing->receiveNs, timing->hostProcessingNs, &queuedNs,
                                                &commonToLocalNs);
         originNs = origin.ns;
         originSynced = origin.synced;
-        traceReceived(hostPtsNs, timing->receiveNs, timing->enqueueNs, queuedNs, commonToLocalNs,
-                      timing->hostProcessingNs);
+        if (recordTiming) {
+            uint32_t rttVarianceMs = 0;
+            if (!LiGetEstimatedRttInfo(&rttMs, &rttVarianceMs)) {
+                rttMs = 0;
+            }
+        }
     }
     bool deadlineEnabled;
     int64_t deadlineOffsetUs;
@@ -1490,6 +1496,10 @@ bool VulkanRenderer::submitPyrowaveFrame(const PyrowaveBytes& frameBytes, const 
         }
         deadlineEnabled = partialDeadlineEnabled_;
         deadlineOffsetUs = partialDeadlineOffsetUs_;
+        if (recordTiming) {
+            trace_.received(hostPtsNs, timing->receiveNs, timing->enqueueNs, queuedNs, commonToLocalNs,
+                            timing->hostProcessingNs, rttMs);
+        }
         if (partial != PyrowaveDecoder::Partial::None) {
             trace_.partial(hostPtsNs, static_cast<int>(partial));
         }
@@ -2750,9 +2760,13 @@ void VulkanRenderer::abandonDecodeRecord() {
 }
 
 void VulkanRenderer::beforeDecodeSubmit() {
-    std::lock_guard<std::mutex> lock(decodingMutex_);
-    decodeRecording_ = false;
-    outstandingDecodes_++;
+    {
+        std::lock_guard<std::mutex> lock(decodingMutex_);
+        decodeRecording_ = false;
+        outstandingDecodes_++;
+    }
+    // The outstanding decode keeps finishOutstandingDecode() from resuming the
+    // boost work while we wait for its current chunk to drain.
     if (keepBusyGroups_ != 0) {
         keepBusy_.pause();
     }
