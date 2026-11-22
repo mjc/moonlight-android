@@ -862,12 +862,25 @@ bool PyrowaveDecoder::gpuTimes(uint64_t readyValue, int64_t* startNs, int64_t* e
 }
 
 VkResult PyrowaveDecoder::waitDecoded(uint64_t value, uint64_t timeoutNs) {
+    if (completedValue_.load(std::memory_order_acquire) >= value) {
+        return VK_SUCCESS;
+    }
+    const auto noteCompleted = [this, value] {
+        uint64_t completed = completedValue_.load(std::memory_order_relaxed);
+        while (completed < value &&
+               !completedValue_.compare_exchange_weak(completed, value, std::memory_order_release,
+                                                       std::memory_order_relaxed)) {}
+    };
     if (timeline_) {
         VkSemaphoreWaitInfo waitInfo {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         waitInfo.semaphoreCount = 1;
         waitInfo.pSemaphores = &timeline_;
         waitInfo.pValues = &value;
-        return vk_.vkWaitSemaphores(info_.device, &waitInfo, timeoutNs);
+        const VkResult result = vk_.vkWaitSemaphores(info_.device, &waitInfo, timeoutNs);
+        if (result == VK_SUCCESS) {
+            noteCompleted();
+        }
+        return result;
     }
 
     // The decode's slot's fence, which also covers everything submitted to the queue before it.
@@ -887,6 +900,9 @@ VkResult PyrowaveDecoder::waitDecoded(uint64_t value, uint64_t timeoutNs) {
         slot->waiters++;
     }
     const VkResult result = vk_.vkWaitForFences(info_.device, 1, &slot->fence, VK_TRUE, timeoutNs);
+    if (result == VK_SUCCESS) {
+        noteCompleted();
+    }
     {
         std::lock_guard<std::mutex> lock(timestampMutex_);
         slot->waiters--;

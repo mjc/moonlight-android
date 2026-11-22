@@ -314,6 +314,8 @@ private:
     // semaphores, null, and the values only count submissions.
     VkSemaphore timeline_ = VK_NULL_HANDLE;
     uint64_t lastValue_ = 0;
+    // Successful waits establish completion for every earlier decode on this queue.
+    std::atomic<uint64_t> completedValue_ {0};
     // Shared queue, no timeline. Signaled by the decode submit and waited by one draw.
     // Idle until that submit: createPlanes signals the timeline only.
     VkSemaphore blitSem_ = VK_NULL_HANDLE;
