@@ -1,2 +1,2 @@
-0a1f1f2bde553aa9f2bbc0e4235b7c77d3af20a9 Honor configured iDWT storage precision
+fefe13927ebe3c5d92812ca41d1ecbee2fe055d3 Dispatch wavelet bands together during dequantization
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
