@@ -14,6 +14,11 @@ namespace {
     // Host timestamp spacings the slot is taken from
     constexpr size_t kSlotDeltaWindow = 15;
     constexpr size_t kMinSlotDeltas = 8;
+    // Percentage of recent spacings that must fall within a quarter-vsync of a multi-vsync slot
+    // before locking to it (enter) or staying locked (stay). Keeps erratic stalls from locking
+    // multi-vsync slots while tolerating an occasional late host frame on a steady stream.
+    constexpr size_t kSlotEnterInBandPercent = 85;
+    constexpr size_t kSlotStayInBandPercent = 75;
 
     // How much of the part of a slot that host timestamps were early or late is carried to the
     // next frame. Host timestamps jitter: a frame stamped late and the next on time are 1.4 and
@@ -180,7 +185,8 @@ int64_t FramePacer::firstVsyncFromNs(int64_t timeNs) const {
 
 // How many vsyncs each frame should stay on screen, from the spacing of host timestamps: one
 // when the host's frame rate matches our refresh rate, two for 60 fps on 120 Hz, and one when
-// it's no whole number of vsyncs (100 fps on 144 Hz), so frames chain on the finest grid
+// it's no whole number of vsyncs (100 fps on 144 Hz) or when spacing is erratic, so frames chain
+// on the finest grid
 void FramePacer::updateSlot(int64_t hostPtsNs) {
     if (lastPtsNs_ != 0) {
         const int64_t delta = hostPtsNs - lastPtsNs_;
@@ -189,6 +195,9 @@ void FramePacer::updateSlot(int64_t hostPtsNs) {
             if (ptsDeltas_.size() > kSlotDeltaWindow) {
                 ptsDeltas_.pop_front();
             }
+        }
+        else {
+            ptsDeltas_.clear();
         }
     }
     if (ptsDeltas_.size() < kMinSlotDeltas) {
@@ -202,13 +211,23 @@ void FramePacer::updateSlot(int64_t hostPtsNs) {
     std::nth_element(sorted.begin(), sorted.begin() + mid, sorted.begin() + count);
     const int64_t median = sorted[mid];
     const int64_t vsyncs = (median + periodNs_ / 2) / periodNs_;
-    if (vsyncs >= 1 && vsyncs <= 8 && std::llabs(median - vsyncs * periodNs_) * 100 <= periodNs_ * 15) {
-        slotVsyncs_ = vsyncs;
+    int64_t nextSlot = 1;
+    if (vsyncs > 1 && vsyncs <= 8 && std::llabs(median - vsyncs * periodNs_) * 100 <= periodNs_ * 15) {
+        const int64_t candidateNs = vsyncs * periodNs_;
+        size_t inBand = 0;
+        for (const int64_t delta : ptsDeltas_) {
+            if (std::llabs(delta - candidateNs) * 4 <= periodNs_) {
+                inBand++;
+            }
+        }
+        const size_t requiredPercent = (vsyncs == slotVsyncs_) ? kSlotStayInBandPercent : kSlotEnterInBandPercent;
+        if (inBand * 100 >= count * requiredPercent) {
+            nextSlot = vsyncs;
+        }
     }
-    else {
-        // Kept at a slot that no longer fits, frames chained too far apart and had to be pulled
-        // back over and over (a game going from 72 to 100 fps on 144 Hz)
-        slotVsyncs_ = 1;
+    if (nextSlot != slotVsyncs_) {
+        slotVsyncs_ = nextSlot;
+        carry_ = 0;
     }
 }
 
