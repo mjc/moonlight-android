@@ -64,6 +64,22 @@ namespace {
 
 void PyrowaveDecoder::lockQueue(void* userdata) {
     auto* decoder = static_cast<PyrowaveDecoder*>(userdata);
+    auto& submitMutex = decoder->submissionMutex();
+    if (&submitMutex != decoder->info_.queueMutex) {
+        std::unique_lock<std::mutex> deviceLock(*decoder->info_.queueMutex, std::defer_lock);
+        std::unique_lock<std::mutex> submitLock(submitMutex, std::defer_lock);
+        if (std::try_lock(deviceLock, submitLock) != -1) {
+            const int64_t startNs = nowNs();
+            std::lock(deviceLock, submitLock);
+            decoder->waitedNs_ += nowNs() - startNs;
+        }
+        deviceLock.release();
+        submitLock.release();
+        if (decoder->queueSubmitTimingEnabled_) {
+            decoder->queueLockedNs_ = nowNs();
+        }
+        return;
+    }
     if (!decoder->info_.queueMutex->try_lock()) {
         const int64_t startNs = nowNs();
         decoder->info_.queueMutex->lock();
@@ -83,6 +99,9 @@ void PyrowaveDecoder::unlockQueue(void* userdata) {
     if (decoder->queueSubmitTimingEnabled_) {
         decoder->queueHeldNs_ += nowNs() - decoder->queueLockedNs_;
         decoder->queueHolds_++;
+    }
+    if (&decoder->submissionMutex() != decoder->info_.queueMutex) {
+        decoder->submissionMutex().unlock();
     }
     decoder->info_.queueMutex->unlock();
 }
@@ -775,7 +794,7 @@ PyrowavePlanes* PyrowaveDecoder::decode(const PyrowaveBytes& frame, const Gap* g
     VkResult submitted;
     {
         const int64_t lockStartNs = nowNs();
-        std::lock_guard<std::mutex> lock(*info_.queueMutex);
+        std::lock_guard<std::mutex> lock(submissionMutex());
         const int64_t submitStartNs = nowNs();
         waitedNs_ += submitStartNs - lockStartNs;
         submitted = vk_.vkQueueSubmit(info_.queue, 1, &submit, slot.fence);
@@ -1075,7 +1094,7 @@ void PyrowaveDecoder::consumeBlitSemaphore() {
     submit.pWaitDstStageMask = &stage;
     VkResult result;
     {
-        std::lock_guard<std::mutex> lock(*info_.queueMutex);
+        std::lock_guard<std::mutex> lock(submissionMutex());
         result = vk_.vkQueueSubmit(info_.queue, 1, &submit, VK_NULL_HANDLE);
     }
     if (result != VK_SUCCESS) {
@@ -1269,7 +1288,7 @@ bool PyrowaveDecoder::createPlanes(PyrowavePlanes& planes) {
     VkResult result;
     {
         const int64_t lockStartNs = nowNs();
-        std::lock_guard<std::mutex> lock(*info_.queueMutex);
+        std::lock_guard<std::mutex> lock(submissionMutex());
         waitedNs_ += nowNs() - lockStartNs;
         result = vk_.vkQueueSubmit(info_.queue, 1, &submit, fence_);
     }

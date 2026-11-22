@@ -956,6 +956,7 @@ bool VulkanRenderer::createPyrowaveDecoder() {
     info.queue = decodeQueue_ ? decodeQueue_ : queue_;
     info.queueFamily = queueFamily_;
     info.queueMutex = &queueMutex_;
+    info.submitQueueMutex = decodeQueue_ ? &decodeQueueMutex_ : &queueMutex_;
     info.timestampValidBits = timestampValidBits_;
     info.timestampPeriodNs = timestampPeriodNs_;
     info.timelineSemaphores = deviceSetup_.pyrowave.timelineSemaphores;
@@ -964,6 +965,7 @@ bool VulkanRenderer::createPyrowaveDecoder() {
         info.deviceInfo = &decodeDeviceSetup_.info;
         info.queue = decodeDeviceQueue_;
         info.queueMutex = &decodeDeviceQueueMutex_;
+        info.submitQueueMutex = &decodeDeviceQueueMutex_;
         info.renderDevice = device_;
         info.renderVk = &vk_;
     }
@@ -1097,7 +1099,9 @@ void VulkanRenderer::pyrowaveWaiterMain() {
 }
 
 void VulkanRenderer::waitIdle() {
-    std::lock_guard<std::mutex> lock(queueMutex_);
+    std::unique_lock<std::mutex> renderLock(queueMutex_, std::defer_lock);
+    std::unique_lock<std::mutex> decodeLock(decodeQueueMutex_, std::defer_lock);
+    std::lock(renderLock, decodeLock);
     vk_.vkDeviceWaitIdle(device_);
 }
 

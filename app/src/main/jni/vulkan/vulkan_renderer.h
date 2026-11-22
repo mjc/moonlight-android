@@ -310,8 +310,7 @@ private:
     bool ensurePlanarPipeline();
     bool createPipeline(VkPipelineLayout layout, VkShaderModule fragShader, VkPipeline* pipeline);
     void destroyPipelines();
-    // Every use of the queue is under queueMutex_, since PyroWave submits to it from the
-    // decoding thread
+    // Locks both queues before waiting for the device.
     void waitIdle();
     ImportedBuffer* importBuffer(AHardwareBuffer* buffer);
     void destroyImport(AHardwareBuffer* buffer, ImportedBuffer& imported);
@@ -330,8 +329,9 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     // PyroWave's queue, so a render doesn't wait behind the next frame's decode. Null when the
-    // family has only one, which both then share. Either way queueMutex_ covers every queue.
+    // family has only one, which both then share.
     VkQueue decodeQueue_ = VK_NULL_HANDLE;
+    std::mutex decodeQueueMutex_;
     // PyroWave decoding on a device of its own, with a front buffer (or as
     // debug.moonlight.pyrowave_device says). A device's queues share one GPU priority, and the GPU
     // finishes a decode before starting a draw queued behind it at the same priority: on an

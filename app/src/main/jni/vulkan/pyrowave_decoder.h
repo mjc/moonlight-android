@@ -97,6 +97,9 @@ public:
         VkQueue queue = VK_NULL_HANDLE;
         uint32_t queueFamily = 0;
         std::mutex* queueMutex = nullptr;
+        // Optional lock for submissions to this queue. Library callbacks lock both,
+        // since they may wait for the whole device rather than only this queue.
+        std::mutex* submitQueueMutex = nullptr;
         // For timing decodes on the GPU; no timing if timestampValidBits is 0
         uint32_t timestampValidBits = 0;
         float timestampPeriodNs = 0.0f;
@@ -252,6 +255,9 @@ private:
                      VkDeviceSize size);
     uint32_t planeWidth(int plane) const { return plane == 0 ? width_ : width_ / 2; }
     uint32_t planeHeight(int plane) const { return plane == 0 ? height_ : height_ / 2; }
+    std::mutex& submissionMutex() const {
+        return *(info_.submitQueueMutex ? info_.submitQueueMutex : info_.queueMutex);
+    }
 
     const VkApi& vk_;
     const DeviceInfo info_;
