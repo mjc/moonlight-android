@@ -1,2 +1,2 @@
-67b2b63002bd04a85441c4721fe302838348a9a4 Collapse packed iDWT to fixed 3-bucket/edge pipelines and prewarm
+785cd0854f7025a6735016aa207aef96b6caa65d Disable 2x2 packed wavelets on MoltenVK and Apple GPUs
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
