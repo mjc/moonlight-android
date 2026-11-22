@@ -2,8 +2,10 @@
 #ifdef __ANDROID__
 #include <limits.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
+#include <time.h>
 #endif
 
 #define FIRST_FRAME_MAX 1500
@@ -48,6 +50,12 @@ static bool receivedFullFrame;
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 64
 #define VIDEO_RECV_RING_SLOTS 8192
 #define VIDEO_RECV_RING_MASK (VIDEO_RECV_RING_SLOTS - 1)
+// Wake VideoRecv once this many packets are buffered, or sooner on EOF, clock-sync, or idle.
+#define VIDEO_RECV_WAKE_BATCH 16
+// Coalesce active mid-frame bursts when plenty of ring space remains and the prior batch was small.
+#define VIDEO_RECV_COALESCE_BATCH_THRESHOLD (VIDEO_PACKET_RECEIVE_BATCH_SIZE / 2)
+#define VIDEO_RECV_COALESCE_MIN_FREE_SLOTS (VIDEO_PACKET_RECEIVE_BATCH_SIZE * 2)
+#define VIDEO_RECV_COALESCE_NS (300L * 1000L)
 #else
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
 #endif
@@ -740,10 +748,46 @@ static bool videoReceiveStopped(void) {
            atomic_load_explicit(&videoRecvRing.stopRequested, memory_order_acquire);
 }
 
+static inline bool isUnencryptedEofVideoPacket(const char* data, int len) {
+    if (len < (int)sizeof(RTP_PACKET)) {
+        return false;
+    }
+
+    const uint8_t* bytes = (const uint8_t*)data;
+    int dataOffset = (int)sizeof(RTP_PACKET);
+    if (bytes[offsetof(RTP_PACKET, header)] & FLAG_EXTENSION) {
+        dataOffset += 4;
+    }
+
+    if (len < dataOffset + (int)sizeof(NV_VIDEO_PACKET)) {
+        return false;
+    }
+
+    return (bytes[dataOffset + offsetof(NV_VIDEO_PACKET, flags)] & FLAG_EOF) != 0;
+}
+
+static void flushPendingVideoReceiveWakeup(uint64_t writeIdx) {
+    uint64_t readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
+    if (writeIdx != readIdx) {
+        // Pair with VideoRecv's consumerWaiting store + seq_cst fence so a deferred wake
+        // cannot be lost before VideoDrain blocks again.
+        atomic_thread_fence(memory_order_seq_cst);
+        if (atomic_load_explicit(&videoRecvRing.consumerWaiting, memory_order_relaxed)) {
+            wakeVideoReceiveConsumer();
+        }
+    }
+}
+
 static void VideoDrainThreadProc(void* context) {
     struct mmsghdr messages[VIDEO_PACKET_RECEIVE_BATCH_SIZE] = {0};
     struct iovec vectors[VIDEO_PACKET_RECEIVE_BATCH_SIZE];
+    const struct timespec coalesceTs = {
+        .tv_sec = 0,
+        .tv_nsec = VIDEO_RECV_COALESCE_NS,
+    };
+    bool encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     bool useSelect;
+    bool coalesceNext = false;
     uint64_t lastDropLogMs = 0;
 
     setVideoThreadPriority();
@@ -766,6 +810,21 @@ static void VideoDrainThreadProc(void* context) {
         uint64_t readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
         uint64_t used = writeIdx - readIdx;
         int freeSlots = (used >= VIDEO_RECV_RING_SLOTS) ? 0 : (int)(VIDEO_RECV_RING_SLOTS - used);
+
+        if (coalesceNext && freeSlots >= VIDEO_RECV_COALESCE_MIN_FREE_SLOTS) {
+            (void)clock_nanosleep(CLOCK_MONOTONIC, 0, &coalesceTs, NULL);
+            if (videoDrainStopped()) {
+                break;
+            }
+            // Re-read readIndex in case VideoRecv drained packets while VideoDrain slept.
+            readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
+            used = writeIdx - readIdx;
+            freeSlots = (used >= VIDEO_RECV_RING_SLOTS) ? 0 : (int)(VIDEO_RECV_RING_SLOTS - used);
+        }
+        else {
+            coalesceNext = false;
+        }
+
         int ringSlotsToFill = freeSlots < VIDEO_PACKET_RECEIVE_BATCH_SIZE ? freeSlots : VIDEO_PACKET_RECEIVE_BATCH_SIZE;
 
         for (int i = 0; i < ringSlotsToFill; i++) {
@@ -779,7 +838,10 @@ static void VideoDrainThreadProc(void* context) {
         }
 
         int receivedCount;
-        if (useSelect || freeSlots == 0) {
+        if (coalesceNext) {
+            receivedCount = recvmmsg(rtpSocket, messages, VIDEO_PACKET_RECEIVE_BATCH_SIZE, MSG_DONTWAIT, NULL);
+        }
+        else if (useSelect || freeSlots == 0) {
             struct pollfd pfd;
             int pollRet;
 
@@ -796,6 +858,7 @@ static void VideoDrainThreadProc(void* context) {
                 break;
             }
             if (pollRet == 0) {
+                flushPendingVideoReceiveWakeup(writeIdx);
                 continue;
             }
 
@@ -821,6 +884,8 @@ static void VideoDrainThreadProc(void* context) {
         if (receivedCount < 0) {
             int sockErr = LastSocketError();
             if (sockErr == EWOULDBLOCK || sockErr == EAGAIN || sockErr == EINTR) {
+                coalesceNext = false;
+                flushPendingVideoReceiveWakeup(writeIdx);
                 continue;
             }
             Limelog("Video Drain: recvmmsg() failed: %d\n", sockErr);
@@ -828,6 +893,8 @@ static void VideoDrainThreadProc(void* context) {
             break;
         }
         if (receivedCount == 0) {
+            coalesceNext = false;
+            flushPendingVideoReceiveWakeup(writeIdx);
             continue;
         }
 
@@ -835,20 +902,42 @@ static void VideoDrainThreadProc(void* context) {
         int dropped = receivedCount - accepted;
 
         if (accepted > 0) {
+            bool sawClockSync = false;
+            bool sawEof = false;
+
             for (int i = 0; i < accepted; i++) {
                 PVIDEO_RECV_RING_SLOT slot = videoRecvRingSlot((writeIdx + (uint64_t)i) & VIDEO_RECV_RING_MASK);
                 int len = (int)messages[i].msg_len;
                 slot->length = len;
                 if (len == sizeof(SS_CLOCK_SYNC_REPLY)) {
                     slot->receivedUs = PltGetMicroseconds();
+                    sawClockSync = true;
+                }
+                else if (!encrypted && isUnencryptedEofVideoPacket(videoRecvRingSlotData(slot), len)) {
+                    sawEof = true;
                 }
             }
 
-            atomic_store_explicit(&videoRecvRing.writeIndex, writeIdx + (uint64_t)accepted, memory_order_release);
-            atomic_thread_fence(memory_order_seq_cst);
-            if (atomic_load_explicit(&videoRecvRing.consumerWaiting, memory_order_relaxed)) {
-                wakeVideoReceiveConsumer();
+            uint64_t nextWrite = writeIdx + (uint64_t)accepted;
+            atomic_store_explicit(&videoRecvRing.writeIndex, nextWrite, memory_order_release);
+
+            readIdx = atomic_load_explicit(&videoRecvRing.readIndex, memory_order_acquire);
+            uint64_t buffered = nextWrite - readIdx;
+            if (sawClockSync || sawEof || buffered >= VIDEO_RECV_WAKE_BATCH) {
+                atomic_thread_fence(memory_order_seq_cst);
+                if (atomic_load_explicit(&videoRecvRing.consumerWaiting, memory_order_relaxed)) {
+                    wakeVideoReceiveConsumer();
+                }
             }
+
+            int remainingFree = (buffered >= VIDEO_RECV_RING_SLOTS) ? 0 : (int)(VIDEO_RECV_RING_SLOTS - buffered);
+            coalesceNext = !sawClockSync && !sawEof &&
+                           receivedCount < VIDEO_RECV_COALESCE_BATCH_THRESHOLD &&
+                           remainingFree >= VIDEO_RECV_COALESCE_MIN_FREE_SLOTS;
+        }
+        else {
+            coalesceNext = false;
+            flushPendingVideoReceiveWakeup(writeIdx);
         }
 
         if (dropped > 0) {
