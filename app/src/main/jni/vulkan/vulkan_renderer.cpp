@@ -307,16 +307,21 @@ bool VulkanRenderer::prepareDevice(VkApi& vk, VkPhysicalDevice device, uint32_t 
     setup.queue.queueFamilyIndex = queueFamily;
     setup.queue.queueCount = 1;
     // To compare where PyroWave decodes: adb shell setprop debug.moonlight.pyrowave_queue low (its
-    // own queue below rendering, the default), equal (its own queue, same priority) or shared
-    // (rendering's queue). On a Pixel 10 Pro at 60 fps, a tenth of decodes take 10-16 ms instead
-    // of 6, in streaks of a few frames, whichever queue they're on; shared also showed a few
-    // times more frames late to the screen, a render waiting behind a decode.
+    // own queue below rendering), equal (its own queue, same priority) or shared (rendering's
+    // queue). On Tegra X1 (NVIDIA), low priority lets rendering and SurfaceFlinger preempt iDWT
+    // mid-frame for +4.5 ms while shared increases late presents when draws wait behind decodes;
+    // default Tegra to equal priority unless overridden. On other GPUs, keep low as the default.
     char queueMode[PROP_VALUE_MAX] = {};
     __system_property_get("debug.moonlight.pyrowave_queue", queueMode);
+    VkPhysicalDeviceProperties props {};
+    if (pyrowave) {
+        vk.vkGetPhysicalDeviceProperties(device, &props);
+    }
     if (pyrowave && strcmp(queueMode, "shared") != 0 && queueFamily < familyCount &&
             families[queueFamily].queueCount >= 2) {
         setup.queue.queueCount = 2;
-        setup.priorities[0] = strcmp(queueMode, "equal") == 0 ? 1.0f : 0.0f;
+        const bool defaultEqual = queueMode[0] == 0 && props.vendorID == 0x10DE;
+        setup.priorities[0] = (strcmp(queueMode, "equal") == 0 || defaultEqual) ? 1.0f : 0.0f;
     }
     if (pyrowave && queueMode[0] != 0) {
         ALOGI("PyroWave queue: %s was asked for", queueMode);
@@ -334,8 +339,6 @@ bool VulkanRenderer::prepareDevice(VkApi& vk, VkPhysicalDevice device, uint32_t 
 
     if (pyrowave) {
         // PyroWave sees what the device has enabled, so give it all the device supports
-        VkPhysicalDeviceProperties props;
-        vk.vkGetPhysicalDeviceProperties(device, &props);
         if (!setup.pyrowave.query(vk, device, std::min(props.apiVersion, kPyrowaveApiVersion))) {
             ALOGI("%s can't run PyroWave", props.deviceName);
             return false;
@@ -1043,6 +1046,14 @@ void VulkanRenderer::pyrowaveWaiterMain() {
         }
 
         const VkResult result = pyrowave_->waitDecoded(frame->readyValue, kFenceTimeoutNs);
+        // When presenting immediately on a separate decode queue, hold keep-busy across the short
+        // handoff to drawFrame() so boost chunks don't collide with the render blit and stall the
+        // next frame's beforeDecodeSubmit() pause.
+        if (!shareQueue && result == VK_SUCCESS && keepBusyGroups_ != 0 && presentAhead_ && !presentOnArrival_) {
+            frame->keepBusy = &keepBusy_;
+            frame->blitHold.store(true, std::memory_order_relaxed);
+            keepBusy_.holdUnarmedBlit();
+        }
         finishOutstandingDecode();
         if (result != VK_SUCCESS) {
             ALOGE("PyroWave decode didn't finish: %d", result);
@@ -2442,7 +2453,7 @@ bool VulkanRenderer::renderFrame(const FramePtr& frame, uint64_t presentId, int6
         }
         return false;
     }
-    if (frame->sharedBlit && keepBusyGroups_ != 0) {
+    if (frame->pyrowave && keepBusyGroups_ != 0) {
         const uint64_t generation = ++nextBlitGen_;
         const bool releaseHold = frame->blitHold.exchange(false, std::memory_order_relaxed);
         if (keepBusy_.armBlitGate(vk_.vkWaitForFences, device_, fences_[slot], generation, releaseHold)) {
