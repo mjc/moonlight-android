@@ -1,2 +1,2 @@
-2ba51a9a513f616facb5d6c7b56249bac329e6e4 Add UMA zero-copy payload upload and Vulkan 1.1 shader path selection
+55a0bed824254e4f93a34b5493d782b1d25d74d1 Restore coalesced idwt.comp and dwt_common.h to fix Maxwell register spill
 Granite 53090429539bf3404250d18fe58db971f0907c04 Enable ycbcr sampling in ancient path as well.
