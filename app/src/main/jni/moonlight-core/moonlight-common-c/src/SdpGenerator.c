@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include <limits.h>
 #include <inttypes.h>
 
 #define MAX_OPTION_NAME_LEN 128
@@ -299,6 +300,7 @@ static int pyrowavePictureBitrateKbps(int width, int height, int fps, int tenBit
 // stands.
 static int pyrowaveSocketBitrateKbps(int payloadBytes, int fps) {
     int frameBytes;
+    long long kbps;
 
     if (payloadBytes <= 0) {
         return 0;
@@ -310,7 +312,20 @@ static int pyrowaveSocketBitrateKbps(int payloadBytes, int fps) {
     if (frameBytes < 1) {
         return 0;
     }
-    return (int)((long long)frameBytes * 8 * fps / 1000);
+    kbps = (long long)frameBytes * 8 * fps / 1000;
+    return kbps > INT_MAX ? INT_MAX : (int)kbps;
+}
+
+// Effective UDP receive buffer capacity for PyroWave burst sizing. When a
+// platform drains the kernel socket into a userspace ring and the kernel
+// socket itself holds at least 512 KiB, use the larger capacity; tiny or
+// failed kernel probes fall back to the kernel value unchanged.
+static int pyrowaveReceivePayloadBytes(int kernelPayloadBytes, int ringPayloadBytes) {
+    const int minKernelPayloadBytes = 512 * 1024;
+    if (ringPayloadBytes > 0 && kernelPayloadBytes >= minKernelPayloadBytes) {
+        return kernelPayloadBytes > ringPayloadBytes ? kernelPayloadBytes : ringPayloadBytes;
+    }
+    return kernelPayloadBytes;
 }
 
 static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
@@ -409,7 +424,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             requestedBitrate = pictureBitrate;
         }
         {
-            int payloadBytes = udpReceivePayloadBytes();
+            int kernelPayloadBytes = udpReceivePayloadBytes();
+            int ringPayloadBytes = videoReceiveRingPayloadBytes(StreamConfig.packetSize);
+            int payloadBytes = pyrowaveReceivePayloadBytes(kernelPayloadBytes, ringPayloadBytes);
             int socketBitrate = pyrowaveSocketBitrateKbps(payloadBytes, StreamConfig.fps);
             if (socketBitrate > 0 && requestedBitrate > socketBitrate) {
                 Limelog("Capping PyroWave bitrate from %d Kbps to %d Kbps to fit a %d byte receive buffer",
