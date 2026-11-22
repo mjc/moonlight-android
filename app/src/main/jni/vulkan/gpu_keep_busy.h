@@ -61,12 +61,16 @@ public:
 
 private:
     static constexpr int kInFlight = 2;
+    // Two sequential dispatches per submit keep Tegra X1 preemption at half-chunk granularity
+    // while halving vkQueueSubmit and fence-wait frequency.
+    static constexpr uint32_t kDispatchesPerSubmit = 2;
     static constexpr uint32_t kGroupSize = 64;  // keep_busy.comp's local_size_x
 
     bool createDevice(VkPhysicalDevice physicalDevice, uint32_t queueFamily, const char* globalPriorityExt);
     bool createResources(VkPhysicalDevice physicalDevice, uint32_t queueFamily);
     void destroy();
     void run();
+    bool recordSlot(int slot, uint32_t iterations);
     bool submit(int slot);
     // Under pauseMutex_. Submits both slots. On failure marks the thread stopped.
     bool submitPair(std::unique_lock<std::mutex>& lock);
@@ -94,6 +98,7 @@ private:
     int64_t chunkNs_ = 0;
     uint32_t groups_ = 0;
     uint32_t iterations_ = 0;
+    uint32_t recordedIterations_[kInFlight] = {};
     std::atomic<bool> quit_ {false};
     bool paused_ = false;  // Under pauseMutex_
     int inFlight_ = 0;     // Submitted chunks not yet waited. Under pauseMutex_

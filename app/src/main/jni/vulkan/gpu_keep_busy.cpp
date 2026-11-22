@@ -41,6 +41,9 @@ bool GpuKeepBusy::start(const VkApi& vk, VkInstance instance, VkPhysicalDevice p
     chunkNs_ = chunkNs;
     groups_ = groups;
     iterations_ = 1000;
+    for (uint32_t& recorded : recordedIterations_) {
+        recorded = 0;
+    }
     if (!createDevice(physicalDevice, queueFamily, globalPriorityExt) || !createResources(physicalDevice, queueFamily)) {
         destroy();
         return false;
@@ -77,7 +80,7 @@ void GpuKeepBusy::stop() {
 
 void GpuKeepBusy::requestPause() {
     std::lock_guard<std::mutex> lock(pauseMutex_);
-    if (quit_) {
+    if (quit_ || paused_) {
         return;
     }
     paused_ = true;
@@ -89,8 +92,10 @@ void GpuKeepBusy::pause() {
     if (quit_) {
         return;
     }
-    paused_ = true;
-    pauseCv_.notify_all();
+    if (!paused_) {
+        paused_ = true;
+        pauseCv_.notify_all();
+    }
     pauseCv_.wait(lock, [this] { return quit_.load() || inFlight_ == 0; });
 }
 
@@ -104,7 +109,9 @@ void GpuKeepBusy::releaseUnarmedBlit() {
     if (unarmedBlits_ > 0) {
         unarmedBlits_--;
     }
-    pauseCv_.notify_all();
+    if (!paused_ && unarmedBlits_ == 0) {
+        pauseCv_.notify_all();
+    }
 }
 
 bool GpuKeepBusy::armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence fence, uint64_t generation,
@@ -117,14 +124,18 @@ bool GpuKeepBusy::armBlitGate(PFN_vkWaitForFences wait, VkDevice device, VkFence
     }
     if (!wait || device == VK_NULL_HANDLE || fence == VK_NULL_HANDLE || generation == 0 || quit_ ||
             !thread_.joinable()) {
-        pauseCv_.notify_all();
+        if (!paused_ && unarmedBlits_ == 0) {
+            pauseCv_.notify_all();
+        }
         return false;
     }
     blitWait_ = wait;
     blitDevice_ = device;
     blitFence_ = fence;
     blitGeneration_ = generation;
-    pauseCv_.notify_all();
+    if (!paused_) {
+        pauseCv_.notify_all();
+    }
     return true;
 }
 
@@ -298,6 +309,7 @@ bool GpuKeepBusy::createDevice(VkPhysicalDevice physicalDevice, uint32_t queueFa
     KEEP_BUSY_LOAD(vkCmdBindDescriptorSets)
     KEEP_BUSY_LOAD(vkCmdPushConstants)
     KEEP_BUSY_LOAD(vkCmdDispatch)
+    KEEP_BUSY_LOAD(vkCmdPipelineBarrier)
     KEEP_BUSY_LOAD(vkCreateFence)
     KEEP_BUSY_LOAD(vkDestroyFence)
     KEEP_BUSY_LOAD(vkWaitForFences)
@@ -465,28 +477,62 @@ void GpuKeepBusy::destroy() {
     queue_ = VK_NULL_HANDLE;
 }
 
-bool GpuKeepBusy::submit(int slot) {
+bool GpuKeepBusy::recordSlot(int slot, uint32_t iterations) {
+    recordedIterations_[slot] = 0;
     VkCommandBuffer cmd = commandBuffers_[slot];
-    vk_.vkResetCommandBuffer(cmd, 0);
+    if (vk_.vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+        return false;
+    }
+    // Reusable across sequential submissions once this slot's fence signals; no simultaneous use.
     VkCommandBufferBeginInfo beginInfo {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk_.vkBeginCommandBuffer(cmd, &beginInfo);
+    if (vk_.vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS) {
+        return false;
+    }
     vk_.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vk_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
-    vk_.vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(iterations_), &iterations_);
-    vk_.vkCmdDispatch(cmd, groups_, 1, 1);
+    const uint32_t perDispatch = std::max(1u, iterations / kDispatchesPerSubmit);
+    vk_.vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(perDispatch), &perDispatch);
+    VkMemoryBarrier barrier {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (uint32_t i = 0; i < kDispatchesPerSubmit; i++) {
+        if (i > 0) {
+            // Serialize dispatches so they cannot overlap on SMs and keep a preemption boundary between them.
+            vk_.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+        }
+        vk_.vkCmdDispatch(cmd, groups_, 1, 1);
+    }
     if (vk_.vkEndCommandBuffer(cmd) != VK_SUCCESS) {
         return false;
     }
+    recordedIterations_[slot] = iterations;
+    return true;
+}
 
+bool GpuKeepBusy::submit(int slot) {
+    if (recordedIterations_[slot] != iterations_ && !recordSlot(slot, iterations_)) {
+        return false;
+    }
     VkSubmitInfo submitInfo {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vk_.vkResetFences(device_, 1, &fences_[slot]);
+    submitInfo.pCommandBuffers = &commandBuffers_[slot];
+    if (vk_.vkResetFences(device_, 1, &fences_[slot]) != VK_SUCCESS) {
+        return false;
+    }
     return vk_.vkQueueSubmit(queue_, 1, &submitInfo, fences_[slot]) == VK_SUCCESS;
 }
 
 void GpuKeepBusy::run() {
+    for (int i = 0; i < kInFlight; i++) {
+        if (!recordSlot(i, iterations_)) {
+            ALOGW("Couldn't record work to keep the GPU busy");
+            std::unique_lock<std::mutex> lock(pauseMutex_);
+            stopRun(lock);
+            return;
+        }
+    }
+
     // Two dispatches in flight, so the GPU has the next one when one ends. With nothing else to
     // run, they end a chunk apart; the quickest of them are sized to chunkNs_.
     std::vector<int64_t> intervals;
@@ -506,6 +552,7 @@ void GpuKeepBusy::run() {
                 if (paused_) {
                     continue;
                 }
+                lastDoneNs = nowNs();
                 if (!submitPair(lock)) {
                     return;
                 }
@@ -530,8 +577,11 @@ void GpuKeepBusy::run() {
             std::nth_element(intervals.begin(), quickest, intervals.end());
             const int64_t chunkNs = std::max<int64_t>(*quickest, 1);
             const double scale = std::clamp(static_cast<double>(chunkNs_) / static_cast<double>(chunkNs), 0.25, 4.0);
-            iterations_ = static_cast<uint32_t>(std::clamp(iterations_ * scale, static_cast<double>(kMinIterations),
-                                                           static_cast<double>(kMaxIterations)));
+            // Ignore small timing jitter so steady-state command buffers stay cached without re-recording.
+            if (scale < 0.92 || scale > 1.08) {
+                iterations_ = static_cast<uint32_t>(std::clamp(iterations_ * scale, static_cast<double>(kMinIterations),
+                                                               static_cast<double>(kMaxIterations)));
+            }
             if (now - statsStartNs >= kStatsIntervalNs) {
                 ALOGI("Kept the GPU busy: %llu chunks in %.1f s, the quickest quarter %lld us or quicker, now %u iterations",
                       static_cast<unsigned long long>(chunks), (now - statsStartNs) / 1e9,
@@ -542,17 +592,27 @@ void GpuKeepBusy::run() {
             intervals.clear();
         }
 
+        if (recordedIterations_[slot] != iterations_ && !recordSlot(slot, iterations_)) {
+            ALOGW("Couldn't record work to keep the GPU busy");
+            std::unique_lock<std::mutex> lock(pauseMutex_);
+            stopRun(lock);
+            return;
+        }
+
         {
             std::unique_lock<std::mutex> lock(pauseMutex_);
             inFlight_--;
             if (inFlight_ == 0) {
                 pauseCv_.notify_all();
+                // Both slots are now idle; restart at the top so waitBlitGate() and submitPair()
+                // re-prime both slots cleanly instead of waiting on an already-signaled fence.
+                continue;
             }
             if (quit_) {
                 return;
             }
             if (paused_) {
-                // This slot is idle. The other one, if any, is waited on the next pass.
+                // This slot is idle. The other one is still in flight and waited on the next pass.
                 slot = (slot + 1) % kInFlight;
                 continue;
             }
