@@ -51,11 +51,11 @@ static bool receivedFullFrame;
 #define VIDEO_RECV_RING_SLOTS 8192
 #define VIDEO_RECV_RING_MASK (VIDEO_RECV_RING_SLOTS - 1)
 // Wake VideoRecv once this many packets are buffered, or sooner on EOF, clock-sync, or idle.
-#define VIDEO_RECV_WAKE_BATCH 16
+#define VIDEO_RECV_WAKE_BATCH 32
 // Coalesce active mid-frame bursts when plenty of ring space remains and the prior batch was small.
 #define VIDEO_RECV_COALESCE_BATCH_THRESHOLD (VIDEO_PACKET_RECEIVE_BATCH_SIZE / 2)
 #define VIDEO_RECV_COALESCE_MIN_FREE_SLOTS (VIDEO_PACKET_RECEIVE_BATCH_SIZE * 2)
-#define VIDEO_RECV_COALESCE_NS (300L * 1000L)
+#define VIDEO_RECV_COALESCE_NS (500L * 1000L)
 #else
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
 #endif
