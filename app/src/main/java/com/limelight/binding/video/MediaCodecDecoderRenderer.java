@@ -717,14 +717,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // pacing (Balanced) drift across SurfaceFlinger's latch cutoff whenever host and
         // display clocks differ, dropping frames in bursts. Route them through HostTimed
         // pacing with FIFO + VK_GOOGLE_display_timing so clock drift resolves as a single
-        // clean adjustment per cycle.
+        // clean adjustment per cycle. Use Balanced headroom (4 ms, maxWait 3 vsyncs) so
+        // brief dark/simple frames with short wire-pacing spans don't trigger immediate
+        // early pulls and cut-short storms when full-detail frames resume.
         int vulkanFramePacing = prefs.framePacing;
         int vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_BALANCED;
-        if (vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_MIN_LATENCY) {
-            vulkanFramePacing = PreferenceConfiguration.FRAME_PACING_HOST_TIMED;
-            vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_LOW_LATENCY;
-        }
-        else if (vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
+        if (vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_MIN_LATENCY ||
+                vulkanFramePacing == PreferenceConfiguration.FRAME_PACING_BALANCED) {
             vulkanFramePacing = PreferenceConfiguration.FRAME_PACING_HOST_TIMED;
             vulkanJitterBuffer = PreferenceConfiguration.JITTER_BUFFER_BALANCED;
         }

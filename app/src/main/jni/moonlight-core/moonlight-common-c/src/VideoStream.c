@@ -1,4 +1,7 @@
 #include "Limelight-internal.h"
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#endif
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -36,7 +39,7 @@ static bool receivedFullFrame;
 
 // Pull short packet bursts from Android's UDP receive queue with one syscall.
 #ifdef __ANDROID__
-#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 16
+#define VIDEO_PACKET_RECEIVE_BATCH_SIZE 32
 #else
 #define VIDEO_PACKET_RECEIVE_BATCH_SIZE 1
 #endif
@@ -558,6 +561,14 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+
+#ifdef __ANDROID__
+    // Match the renderer's display-priority threads so high-bitrate UDP bursts don't
+    // overflow small kernel receive buffers while VideoRecv waits behind normal-priority work.
+    if (setpriority(PRIO_PROCESS, 0, -8) != 0) {
+        setpriority(PRIO_PROCESS, 0, -4);
+    }
+#endif
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;

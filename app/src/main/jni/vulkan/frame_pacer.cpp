@@ -70,6 +70,8 @@ void FramePacer::setJitterBuffer(JitterBuffer jitterBuffer) {
     holdSinceNs_ = 0;
     holdMinRoomNs_ = 0;
     consecutiveLate_ = 0;
+    consecutiveCut_ = 0;
+    continuousFrames_ = 0;
     waitNs_ = 0;
     waitSumNs_ = 0;
     waitFrames_ = 0;
@@ -241,8 +243,11 @@ void FramePacer::onFrameArrived(FrameTiming& frame) {
         holdSinceNs_ = 0;
         holdMinRoomNs_ = 0;
         consecutiveLate_ = 0;
+        consecutiveCut_ = 0;
+        continuousFrames_ = 0;
     }
     else {
+        continuousFrames_++;
         // The vsync after the last frame's, as many slots on as the host timestamps moved
         const int64_t slotPeriodNs = slotVsyncs_ * periodNs_;
         const double slots = carry_ + static_cast<double>(delta) / static_cast<double>(slotPeriodNs);
@@ -261,6 +266,7 @@ void FramePacer::onFrameArrived(FrameTiming& frame) {
             assignedNs = std::max(earliestNs, lastTargetNs_);
             lateFrames_++;
             consecutiveLate_++;
+            consecutiveCut_ = 0;
             holdSinceNs_ = 0;
             holdMinRoomNs_ = 0;
             if (consecutiveLate_ >= preset_.lateStreakToShift ||
@@ -272,8 +278,28 @@ void FramePacer::onFrameArrived(FrameTiming& frame) {
                 lastAssignedNs_ = plannedNs;
             }
         }
+        else if (frame.partialCut) {
+            // Cut short to make this vsync. Never count a truncated frame toward pulling earlier;
+            // if consecutive frames are cut short, the schedule is anchored a vsync too early for
+            // full paced frames, so back off by one vsync to break the cut-short feedback loop.
+            consecutiveLate_ = 0;
+            consecutiveCut_++;
+            holdSinceNs_ = 0;
+            holdMinRoomNs_ = 0;
+            if (consecutiveCut_ >= kCutStreakToShift) {
+                assignedNs = plannedNs + periodNs_;
+                lastAssignedNs_ = assignedNs;
+                lateFrames_++;
+                consecutiveCut_ = 0;
+            }
+            else {
+                assignedNs = plannedNs;
+                lastAssignedNs_ = assignedNs;
+            }
+        }
         else {
             consecutiveLate_ = 0;
+            consecutiveCut_ = 0;
             assignedNs = plannedNs;
             if (waitNs >= preset_.maxWaitVsyncs * periodNs_) {
                 // Waiting too long (frames bunched up after a stall, cold start decode, or the host running fast)
@@ -403,7 +429,9 @@ void FramePacer::addReadyCost(int64_t costNs) {
 
 bool FramePacer::partialDeadlineOffsetNs(const FrameTiming& frame, int64_t* offsetNs, int64_t* readyByNs,
                                          int64_t* readyCostNs) const {
-    if (mode_ != PacingMode::HostTimed || !anchored_ || readyCosts_.size() < kPartialMinReadySamples) {
+    if (mode_ != PacingMode::HostTimed || !anchored_ ||
+        continuousFrames_ < kPartialMinContinuousFrames ||
+        readyCosts_.size() < kPartialMinReadySamples) {
         return false;
     }
 

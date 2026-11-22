@@ -1507,6 +1507,7 @@ bool VulkanRenderer::submitPyrowaveFrame(const PyrowaveBytes& frameBytes, const 
     // pacer before the fence, so the draw is submitted before the next decode.
     auto frame = std::make_shared<VideoFrame>(pyrowave_.get(), planes, readyValue);
     frame->timing.hostPtsNs = hostPtsNs;
+    frame->timing.partialCut = (partial == PyrowaveDecoder::Partial::Cut);
     frame->decodeStartNs = startNs;
     frame->decodeQueuedNs = nowNs();
     frame->decodeTimes = times;
@@ -1601,7 +1602,7 @@ void VulkanRenderer::updatePartialDeadline(const VideoFrame& frame) {
     const int64_t commonToLocalNs = nowNs() - static_cast<int64_t>(LiGetMicroseconds()) * 1000;
     const int64_t lastPacketNs = frame.lastPacketUs * 1000 + commonToLocalNs;
     const int64_t decodeFromNs = std::max(lastPacketNs, lastDecodedNs_);
-    if (frame.timing.arrivalNs >= decodeFromNs) {
+    if (!frame.timing.partialCut && frame.timing.arrivalNs >= decodeFromNs) {
         pacer_.addReadyCost(frame.timing.arrivalNs - decodeFromNs);
     }
 

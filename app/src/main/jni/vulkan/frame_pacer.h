@@ -24,6 +24,7 @@ struct FrameTiming {
     int64_t hostPtsNs = 0;   // Host present time, in the stream's timestamp epoch
     int64_t arrivalNs = 0;   // Local CLOCK_MONOTONIC time the decoded frame became available
     int64_t targetNs = 0;    // HostTimed: the vsync the frame is assigned to
+    bool partialCut = false; // Cut short at its partial-frame deadline (PyroWave)
 };
 
 // Matches PreferenceConfiguration.JITTER_BUFFER_*. Any other value (from presets since removed,
@@ -186,6 +187,13 @@ public:
     static constexpr int kPartialReadyPercentile = 90;
     static constexpr size_t kPartialReadySamples = 64;
     static constexpr size_t kPartialMinReadySamples = 16;
+    // Consecutive cut-short frames that still met their vsync before shifting the schedule a vsync
+    // later. A lone jitter spike is cut without stalling, while a schedule anchored too early for
+    // paced frames backs off instead of cutting every frame indefinitely.
+    static constexpr int kCutStreakToShift = 2;
+    // Continuous frames required after an anchor reset before arming a partial-frame deadline, so
+    // sparse keepalive frames (e.g. 1 Hz idle) aren't cut against an arbitrary re-anchor phase.
+    static constexpr uint32_t kPartialMinContinuousFrames = 4;
 
 private:
     // plannedVsyncNs(), or with committable false, the vsync even if it's too far off to
@@ -232,6 +240,8 @@ private:
     int64_t holdSinceNs_ = 0;     // Since when every frame had a vsync to spare, or 0
     int64_t holdMinRoomNs_ = 0;   // Smallest roomNs seen during the current hold window
     int consecutiveLate_ = 0;     // Consecutive frames that missed their scheduled vsync
+    int consecutiveCut_ = 0;      // Consecutive cut-short frames that met their scheduled vsync
+    uint32_t continuousFrames_ = 0; // Consecutive continuous frames since the last anchor reset
     int64_t waitNs_ = 0;
     int64_t waitSumNs_ = 0;
     uint32_t waitFrames_ = 0;
